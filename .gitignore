@@ -1,0 +1,7 @@
+node_modules/
+dist/
+artifacts/
+.DS_Store
+*.log
+*.duckdb
+*.db

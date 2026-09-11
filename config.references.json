@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Pi Coding Agent SDK",
+    "url": "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/sdk.md",
+    "retrieved_on": "2026-09-11",
+    "role": "runner session, tools, events, and isolation configuration"
+  },
+  {
+    "name": "Spider 2.0-DBT task list",
+    "url": "https://github.com/xlang-ai/Spider2/blob/main/spider2-dbt/examples/spider2-dbt.jsonl",
+    "retrieved_on": "2026-09-11",
+    "role": "official task descriptions"
+  },
+  {
+    "name": "Spider 2.0-DBT official evaluator",
+    "url": "https://github.com/xlang-ai/Spider2/blob/main/spider2-dbt/evaluation_suite/evaluate.py",
+    "retrieved_on": "2026-09-11",
+    "role": "external post-run scoring entry"
+  }
+]

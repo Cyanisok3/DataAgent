@@ -1,0 +1,69 @@
+instance_id,tier,difficulty_score,n_models,models_kb,impl_lines,joins_ctes,macros,macro_lines,n_check_tabs,inst_len,instruction
+playbook002,轻量,3.8,0,0.0,112,1,0,0,2,80,Please assist me in completing the data transformation project of this database.
+hive001,轻量,5.8,0,0.0,95,2,0,0,2,142,"Process raw COVID-19 case data, clean it, and join it with country codes to disp"
+divvy001,轻量,6.3,1,0.1,148,0,0,0,2,215,"Analyze bike trips by combining user data, trip duration, and geo-locational inf"
+mrr002,轻量,6.3,3,3.2,314,7,1,9,1,100,Please complete this data transformation project to analyze the trends in user s
+reddit001,轻量,6.4,0,0.0,115,0,2,16,2,198,clean and join Reddit post and comment data from paranormal subreddits to analyz
+retail001,轻量,6.5,5,1.9,207,6,0,0,1,131,"Which countries have the highest total revenue based on the number of invoices, "
+social_media001,轻量,6.7,1,0.6,172,1,1,23,3,110,"Generate a comprehensive social media report that includes Facebook, Instagram, "
+mrr001,轻量,6.9,4,3.7,339,8,1,9,1,81,Complete the project on this database to calculate the monthly recurring revenue
+playbook001,轻量,8.1,1,2.0,109,3,0,0,1,205,Complete the project of this database to show the metrics of each traffic source
+movie_recomm001,轻量,8.2,6,1.1,156,7,0,0,1,170,"combine movie_recomm original programs from various genres, clean up their title"
+netflix001,轻量,8.3,5,2.2,257,5,0,0,1,165,"combine Netflix original programs from various genres, clean up their titles, an"
+asset001,轻量,8.5,8,1.2,124,2,0,0,2,153,"Calculate the average bid, ask, and mid prices for stock tickers on a daily basi"
+flicks001,轻量,8.5,7,1.0,175,2,2,10,2,189,How can I calculate the average IMDb and TMDb ratings for actors based on the mo
+airport001,轻量,9.0,3,3.4,490,6,3,52,2,149,"aggregate and summarize Malaysian airport arrival data, including flight counts "
+twilio001,轻量,9.3,2,3.0,312,10,0,0,2,191,"Aggregate messaging data for Twilio, one at the phone number level and another a"
+biketheft001,轻量,9.4,3,2.8,247,5,0,0,1,240,"How can I combine current and archived theft report data, join it with geographi"
+superstore001,轻量,10.6,10,2.4,254,10,0,0,2,182,How can I generate a dataset that associates sales transactions with their respe
+tpch002,常规,10.7,6,5.0,350,16,0,0,2,135,"Find low-cost brass part suppliers located in the United Kingdom, including thei"
+xero001,常规,11.3,4,6.2,467,17,0,0,1,106,Create a balance sheet report that represents the balance sheet state for each a
+tpch001,常规,11.6,6,3.9,239,10,0,0,1,203,Calculate the lifetime value of a customer by analyzing their total purchases an
+recharge001,常规,11.8,2,9.1,382,18,0,0,1,175,"Create a model to combine charge data, including line items, discounts, taxes, s"
+gitcoin001,常规,12.2,9,4.9,418,11,0,0,2,182,"Transform and clean the raw application, project, and application answer data by"
+app_reporting001,常规,12.2,14,5.6,583,14,0,0,2,55,Please generate reports for app version and OS version.
+xero_new001,常规,12.3,2,1.7,336,12,0,0,3,261,You are tasked with completing a data transformation project to generate three f
+google_ads001,常规,13.7,4,8.2,600,17,1,13,2,189,"Generate reports for Google Ads campaigns and keywords, including spend, clicks,"
+inzight001,常规,13.8,5,3.6,895,7,0,0,1,182,"Calculate the monthly peak electricity usage, along with its 12-month rolling av"
+xero_new002,常规,13.8,3,4.9,320,18,0,0,1,227,"Generate a monthly balance sheet report, summarizing asset, equity, and liabilit"
+airbnb001,常规,14.0,9,6.5,518,11,5,86,2,170,"Aggregate user reviews by sentiment on a daily and month-over-month basis, while"
+maturity001,常规,15.0,9,5.3,509,14,9,218,2,193,"How can I retrieve detailed information about doctors, including their specialti"
+app_reporting002,常规,15.2,15,6.2,558,15,0,0,3,82,Please generate an overview report of the app combine apple store and google pla
+chinook001,常规,15.5,13,5.5,735,16,1,11,3,169,"Create a comprehensive invoice table that combines invoice details, customer inf"
+activity001,常规,16.2,17,8.7,480,0,0,0,2,192,How can I compare user activities to see how many users signed up and visited a 
+provider001,常规,16.6,2,6.8,291,6,1,12,2,341,"How can I map Medicare specialties to NUCC taxonomy codes, prioritize the most s"
+scd001,常规,17.0,6,6.3,546,33,7,136,2,269,"Generate a report that aggregates corporate account metrics, including the numbe"
+salesforce001,常规,18.9,8,21.9,1128,41,1,8,1,134,"I need a daily report on key sales activities—covering tasks completed, events h"
+sap001,常规,19.3,12,37.6,2267,21,2,66,2,113,Can you explain the process used to handle and aggregate SAP general ledger data
+google_play001,常规,19.4,7,27.5,1103,41,0,0,2,118,Generate a Google Play country report and a Google Play device report based on a
+tickit001,常规,19.4,17,13.8,945,31,0,0,1,112,"Generating a complete sales summary that includes buyer and seller details, even"
+google_play002,常规,19.6,7,32.4,1266,50,0,0,1,156,"Generate an overview report on Google Play app performance, including installs, "
+airbnb002,常规,19.8,9,7.2,610,12,5,86,2,240,Complete the data transformation by aggregating review data over a 7-day rolling
+recharge002,常规,20.4,9,22.6,1138,54,0,0,1,190,"Calculate daily and running totals for customer transactions, including charges,"
+tickit002,常规,20.8,17,14.0,902,30,0,0,2,158,"Get detailed information about events and ticket listings, including venue detai"
+atp_tour001,常规,20.9,6,21.2,771,11,0,0,3,284,How can you generate a summary report of ATP tennis matches that includes detail
+qualtrics001,常规,21.9,10,43.2,1730,56,0,0,1,252,"calculate key metrics for each directory, including distinct contacts, emails, p"
+apple_store001,常规,22.7,19,29.9,1316,49,0,0,2,98,Please finish the data transformation project to generate source type and territ
+greenhouse001,常规,23.1,14,17.2,1639,78,0,0,2,65,Please generate a report on enhanced data of job and application.
+shopify_holistic_reporting001,常规,23.1,4,9.8,884,68,0,0,1,347,Combine daily customer order data from Shopify and user engagement metrics from 
+intercom001,常规,24.2,7,21.2,925,72,0,0,2,211,Can you explain the process used to calculate admin-specific and optionally team
+analytics_engineering001,常规,25.0,27,13.2,704,36,0,0,2,180,"comprehensive report that combines customer, employee, product, and purchase ord"
+lever001,常规,25.1,16,19.4,1749,89,0,0,1,190,Pull together the data from multiple tables related to job postings and create a
+asana001,常规,25.2,16,22.2,1372,76,0,0,2,162,Can you describe the process used to aggregate task and project metrics for Asan
+marketo001,常规,25.2,20,23.8,1489,42,2,103,1,153,How can I combine the most recent version of each email template with aggregated
+zuora001,困难,25.8,12,36.9,1734,121,0,0,2,71,Generate the daily account overview and the account overview for Zuora.
+jira001,困难,26.7,18,42.8,2301,78,2,31,1,194,"Retrieve information about Jira projects, including project lead details, associ"
+quickbooks002,困难,27.8,24,63.4,2239,89,2,44,1,185,"Generate a table that includes bill and invoice transaction information, includi"
+f1002,困难,29.3,30,17.8,953,66,0,0,3,148,"Summarize Formula 1 constructors' race performances, rank constructors based on "
+f1003,困难,31.2,34,22.4,1051,70,0,0,4,118,"Create data models to track Formula 1 drivers' podium finishes, fastest laps, an"
+pendo001,困难,31.5,31,39.1,2327,132,0,0,2,57,Generate daily metrics reports for Pendo guides and pages
+f1001,困难,33.0,34,20.7,1057,75,0,0,4,187,"Generate views that rank Formula 1 drivers based on the number of fastest laps, "
+shopify001,困难,33.5,27,52.2,2826,137,4,96,2,217,"Create two tables: one that pulls together product data like total sales, refund"
+nba001,困难,33.6,36,31.8,1329,83,2,93,2,266,"Create comprehensive views summarizing NBA teams' regular season, playoff progre"
+quickbooks001,困难,33.7,29,78.8,2933,137,2,44,1,236,Please create a table that unions all records from each model within the double_
+shopify002,困难,34.1,27,52.2,2748,129,4,96,1,309,"Generate a table that combines Shopify discount code data with price rules, orde"
+hubspot001,困难,34.7,36,37.9,2784,66,6,239,2,223,"How can I merge HubSpot contact data with email metrics, engagement activities, "
+quickbooks003,困难,37.0,33,95.9,3654,177,2,44,2,185,"Pull a table with all balance sheet entries for asset, liability, and equity acc"
+workday001,困难,38.1,57,85.5,6981,58,21,602,1,68,Create a table that combines organization roles with worker position
+workday002,困难,38.6,57,84.7,6960,56,21,602,1,105,Create a table that aggregates job profile information along with job family and
+synthea001,困难,40.5,91,86.0,4494,149,0,0,1,181,"How can we aggregate financial data related to healthcare events, such as condit"

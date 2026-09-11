@@ -1,0 +1,25 @@
+{
+  "name": "data-engineering-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A bounded Spider 2.0-DBT diagnostic runner.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "node node_modules/typescript/bin/tsc -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "dev": "node --import tsx src/cli.ts",
+    "start": "node dist/src/cli.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "typebox": "1.3.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.0",
+    "tsx": "4.19.4",
+    "typescript": "5.9.3"
+  }
+}

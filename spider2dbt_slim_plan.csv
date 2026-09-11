@@ -1,0 +1,13 @@
+instance_id,tier,difficulty_score,n_models,impl_lines,joins_ctes,n_check_tabs,instruction
+playbook001,轻量,8.1,1,109,3,1,Complete the project of this database to show the metrics of each traffic source
+divvy001,轻量,6.3,1,148,0,2,"Analyze bike trips by combining user data, trip duration, and geo-locational inf"
+superstore001,轻量,10.6,10,254,10,2,How can I generate a dataset that associates sales transactions with their respe
+tpch002,常规,10.7,6,350,16,2,"Find low-cost brass part suppliers located in the United Kingdom, including thei"
+google_ads001,常规,13.7,4,600,17,2,"Generate reports for Google Ads campaigns and keywords, including spend, clicks,"
+activity001,常规,16.2,17,480,0,2,How can I compare user activities to see how many users signed up and visited a 
+tickit001,常规,19.4,17,945,31,1,"Generating a complete sales summary that includes buyer and seller details, even"
+apple_store001,常规,22.7,19,1316,49,2,Please finish the data transformation project to generate source type and territ
+marketo001,常规,25.2,20,1489,42,1,How can I combine the most recent version of each email template with aggregated
+zuora001,困难,25.8,12,1734,121,2,Generate the daily account overview and the account overview for Zuora.
+nba001,困难,33.6,36,1329,83,2,"Create comprehensive views summarizing NBA teams' regular season, playoff progre"
+synthea001,困难,40.5,91,4494,149,1,"How can we aggregate financial data related to healthcare events, such as condit"
