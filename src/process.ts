@@ -181,6 +181,9 @@ function commandOnPath(command: string): boolean {
 }
 
 export function detectRestrictedBackend(): SandboxBackend {
+  const forced = process.env.DATAAGENT_SANDBOX_BACKEND?.trim().toLowerCase();
+  if (forced === "macos" || forced === "macos-sandbox-exec") return "macos-sandbox-exec";
+  if (forced === "docker") return commandOnPath("docker") ? "docker" : "unavailable";
   if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) return "macos-sandbox-exec";
   if (process.env.DATAAGENT_SANDBOX_IMAGE?.trim() && commandOnPath("docker")) return "docker";
   return "unavailable";

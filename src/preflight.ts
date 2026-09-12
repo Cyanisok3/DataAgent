@@ -138,7 +138,7 @@ export async function runPreflight(options: {
   try {
     manifest = await loadSelection(selectionPath);
     examplesRoot = path.resolve(manifest.examples_root);
-    add(checks, { name: "selection_manifest", required: true, passed: true, details: "ready selection with exactly 9 tasks and 3 tasks per tier" });
+    add(checks, { name: "selection_manifest", required: true, passed: true, details: "ready selection with exactly 12 tasks and a 3/6/3 low/medium/high tier split" });
   } catch (error) {
     add(checks, { name: "selection_manifest", required: true, passed: false, details: error instanceof Error ? error.message : String(error) });
   }
@@ -267,8 +267,6 @@ export async function runPreflight(options: {
       smokeRepo,
       "--profiles-dir",
       smokeProfilesDir,
-      "--target-path",
-      targetDir,
       "--log-path",
       logDir,
     ];
@@ -331,14 +329,10 @@ export async function runPreflight(options: {
   add(checks, { name: "evaluator_script", required: true, passed: await fileExists(evaluatorScript), details: evaluatorScript });
   add(checks, { name: "gold_file", required: true, passed: await fileExists(path.join(goldDir, "spider2_eval.jsonl")), details: path.join(goldDir, "spider2_eval.jsonl") });
 
-  const existingRoundDirs: string[] = [];
-  for (const round of [1, 2] as const) {
-    const resultDir = path.join(experimentRoot, "results", `round-${round}`);
-    if (await fileExists(resultDir)) existingRoundDirs.push(resultDir);
-  }
-  for (const resultDir of existingRoundDirs) {
+  const resultDir = path.join(experimentRoot, "results", "round-1");
+  if (await fileExists(resultDir)) {
     const format = await validateRoundResultDirectory({ resultDir, expectedInstanceIds: manifest?.selected.map((item) => item.row.instance_id) ?? [] });
-    add(checks, { name: `submission_format:${path.basename(resultDir)}`, required: true, passed: format.ok, details: format.problems.join("; ") || "one results_metadata.jsonl plus instance artifact directories" });
+    add(checks, { name: "submission_format:round-1", required: true, passed: format.ok, details: format.problems.join("; ") || "one results_metadata.jsonl plus instance artifact directories" });
   }
 
   const result: PreflightResult = {

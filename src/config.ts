@@ -4,6 +4,8 @@ import type { FixedAgentConfig, RunLimits } from "./types.js";
 
 export const SELECTION_SEED = 20260911 as const;
 export const PI_SDK_VERSION = "0.85.1" as const;
+export const FIXED_MODEL_ID = "deepseek/deepseek-v4-flash" as const;
+export const FIXED_THINKING = "off" as const;
 export const DEFAULT_LIMITS: RunLimits = {
   wallClockMs: 15 * 60 * 1000,
   maxModelRequestAttempts: 30,
@@ -30,8 +32,8 @@ export function createFixedConfig(options: {
   limits?: Partial<RunLimits>;
 }): FixedAgentConfig {
   const limits: RunLimits = { ...DEFAULT_LIMITS, ...options.limits };
-  if (!options.model.trim()) throw new Error("An exact model ID is required for a diagnostic run.");
-  if (!options.thinking.trim()) throw new Error("A fixed thinking level is required for a diagnostic run.");
+  if (options.model !== FIXED_MODEL_ID) throw new Error(`The fixed protocol requires model ${FIXED_MODEL_ID}.`);
+  if (options.thinking !== FIXED_THINKING) throw new Error(`The fixed protocol requires thinking ${FIXED_THINKING}.`);
   return {
     name: "pi-dbt-diagnostic-v1",
     model: options.model,

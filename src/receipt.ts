@@ -36,8 +36,6 @@ function failureLabels(agent: AgentExecutionResult, submission: SubmissionBuildR
 export interface ExecuteRunOptions {
   experimentId: string;
   runId: string;
-  round: 1 | 2;
-  repeat: 1 | 2;
   tier: Tier;
   project: string;
   taskInstruction: string;
@@ -74,8 +72,6 @@ export async function executeRun(options: ExecuteRunOptions): Promise<{ receipt:
     schema_version: "1.0",
     run_id: options.runId,
     experiment_id: options.experimentId,
-    round: options.round,
-    repeat: options.repeat,
     instance_id: options.instanceId,
     tier: options.tier,
     project: options.project,

@@ -28,18 +28,14 @@ function countBy<T extends string>(values: T[]): Map<T, number> {
 export async function writeDiagnosticReport(experimentRoot: string): Promise<string> {
   const root = path.resolve(experimentRoot);
   const plan = await readJson<ExperimentPlan>(path.join(root, "plan.json"));
-  const evaluations = new Map<1 | 2, EvaluationRecord>();
-  for (const round of [1, 2] as const) {
-    const evaluationPath = plan.evaluation_paths[round];
-    if (evaluationPath && await fileExists(evaluationPath)) evaluations.set(round, await readJson<EvaluationRecord>(evaluationPath));
-  }
+  const evaluation = plan.evaluation_path && await fileExists(plan.evaluation_path) ? await readJson<EvaluationRecord>(plan.evaluation_path) : undefined;
   const receipts = new Map<string, RunReceipt>();
   for (const run of plan.runs) {
     if (run.receipt_path && await fileExists(run.receipt_path)) receipts.set(run.run_id, await readJson<RunReceipt>(run.receipt_path));
   }
   const statusCounts = countBy(plan.runs.map((run) => run.status));
-  const officialSuccessful = [...evaluations.values()].filter((evaluation) => evaluation.status === "completed").reduce((sum, evaluation) => sum + (evaluation.successful_runs ?? 0), 0);
-  const officialEvaluated = [...evaluations.values()].filter((evaluation) => evaluation.status === "completed").reduce((sum, evaluation) => sum + (evaluation.evaluated_runs ?? 0), 0);
+  const officialSuccessful = evaluation?.status === "completed" ? evaluation.successful_runs ?? 0 : 0;
+  const officialEvaluated = evaluation?.status === "completed" ? evaluation.evaluated_runs ?? 0 : 0;
   const dbtCounts = countBy([...receipts.values()].map((receipt) => receipt.validation.dbt_status));
   const failureLabels = [...receipts.values()].flatMap((receipt) => receipt.judgment.failure_labels);
   const labelCounts = countBy(failureLabels);
@@ -50,10 +46,10 @@ export async function writeDiagnosticReport(experimentRoot: string): Promise<str
     "# DataAgent 诊断报告",
     "",
     `- experiment_id: ${plan.experiment_id}`,
-    `- protocol: 9 tasks × 2 identical rounds = 18 planned runs` ,
+    `- protocol: ${plan.protocol.task_count} tasks, one run each = ${plan.protocol.total_runs} planned runs` ,
     `- plan_status: ${plan.status}`,
-    `- official success: ${officialSuccessful}/18` ,
-    `- official evaluated: ${officialEvaluated}/18` ,
+    `- official success: ${officialSuccessful}/${plan.protocol.total_runs}` ,
+    `- official evaluated: ${officialEvaluated}/${plan.protocol.total_runs}` ,
     "- dbt validation and official evaluator results are reported separately; dbt pass is not official success.",
     "",
     "## Run status",
@@ -62,30 +58,28 @@ export async function writeDiagnosticReport(experimentRoot: string): Promise<str
     "|---|---:|",
   ];
   for (const [status, count] of [...statusCounts.entries()].sort((left, right) => left[0].localeCompare(right[0]))) lines.push(`| ${cell(status)} | ${count} |`);
-  lines.push("", "## Per-task official results", "", "| instance_id | tier | round 1 | round 2 |", "|---|---|---:|---:|");
-  for (const task of selected) lines.push(`| ${cell(task.instance_id)} | ${cell(task.tier)} | ${cell(scoreFor(evaluations.get(1), task.instance_id))} | ${cell(scoreFor(evaluations.get(2), task.instance_id))} |`);
+  lines.push("", "## Per-task official results", "", "| instance_id | tier | official score |", "|---|---|---:|");
+  for (const task of selected) lines.push(`| ${cell(task.instance_id)} | ${cell(task.tier)} | ${cell(scoreFor(evaluation, task.instance_id))} |`);
 
   lines.push("", "## Tier totals", "", "| tier | planned | successful | evaluated |", "|---|---:|---:|---:|");
   for (const tier of ["low", "medium", "high"] as Tier[]) {
     const taskIds = new Set(selected.filter((task) => task.tier === tier).map((task) => task.instance_id));
     let successful = 0;
     let evaluated = 0;
-    for (const evaluation of evaluations.values()) {
-      for (const taskId of taskIds) {
-        const value = scoreValue(evaluation, taskId);
-        if (value !== null) evaluated += 1;
-        if (value === 1) successful += 1;
-      }
+    for (const taskId of taskIds) {
+      const value = scoreValue(evaluation, taskId);
+      if (value !== null) evaluated += 1;
+      if (value === 1) successful += 1;
     }
-    lines.push(`| ${tier} | ${taskIds.size * 2} | ${successful} | ${evaluated} |`);
+    lines.push(`| ${tier} | ${taskIds.size} | ${successful} | ${evaluated} |`);
   }
 
   lines.push("", "## dbt status", "", "| status | count |", "|---|---:|");
   for (const [status, count] of [...dbtCounts.entries()].sort((left, right) => left[0].localeCompare(right[0]))) lines.push(`| ${cell(status)} | ${count} |`);
-  lines.push("", "## All 18 planned runs", "", "| round | repeat | instance_id | tier | run status | dbt status | receipt |", "|---:|---:|---|---|---|---|---|");
+  lines.push("", `## All ${plan.protocol.total_runs} planned runs`, "", "| instance_id | tier | run status | dbt status | receipt |", "|---|---|---|---|---|");
   for (const run of plan.runs) {
     const receipt = receipts.get(run.run_id);
-    lines.push(`| ${run.round} | ${run.repeat} | ${cell(run.instance_id)} | ${cell(run.tier)} | ${cell(run.status)} | ${cell(receipt?.validation.dbt_status)} | ${receipt ? cell(path.relative(root, run.receipt_path ?? "")) : "—"} |`);
+    lines.push(`| ${cell(run.instance_id)} | ${cell(run.tier)} | ${cell(run.status)} | ${cell(receipt?.validation.dbt_status)} | ${receipt ? cell(path.relative(root, run.receipt_path ?? "")) : "—"} |`);
   }
 
   lines.push("", "## Failure diagnosis", "");
@@ -98,7 +92,7 @@ export async function writeDiagnosticReport(experimentRoot: string): Promise<str
   lines.push("", "### Failure labels", "", "| label | count |", "|---|---:|");
   if (labelCounts.size === 0) lines.push("| none recorded | 0 |");
   for (const [label, count] of [...labelCounts.entries()].sort((left, right) => left[0].localeCompare(right[0]))) lines.push(`| ${cell(label)} | ${count} |`);
-  lines.push("", "## Limitations", "", "- Machine receipts and official evaluator output are not human confirmation.", "- Missing, timeout, and unscored runs remain distinct; no best-of-two score is reported.", "- This report is diagnostic evidence for this fixed 18-run experiment, not a production benchmark claim.", "");
+  lines.push("", "## Limitations", "", "- Machine receipts and official evaluator output are not human confirmation.", "- Missing, timeout, and unscored runs remain distinct.", "- This report is diagnostic evidence for this fixed 12-run experiment, not a production benchmark claim.", "");
   const reportPath = path.join(root, "diagnostic-report.md");
   await writeFile(reportPath, lines.join("\n"), "utf8");
   return reportPath;

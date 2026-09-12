@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { lstat, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   createAgentSession,
@@ -9,9 +9,34 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { createSafeTools } from "./safe-tools.js";
-import { isoNow, truncateText, writeJsonl } from "./files.js";
+import { ensureDir, fileExists, isoNow, toPosix, truncateText, writeJson, writeJsonl } from "./files.js";
+import { hasValidSubmissionArtifact } from "./submission.js";
 import type { DbtValidationRecord, FixedAgentConfig, ToolEventRecord } from "./types.js";
 import type { RunWorkspace } from "./workspace.js";
+
+/**
+ * Runtime-only model registry for this diagnostic runner. The SDK ships a
+ * built-in `deepseek` provider (openai-completions API) with a
+ * `deepseek-v4-flash` model; this config only pins the official base URL so
+ * requests are unaffected by any local defaults. The API key is injected into
+ * the SDK runtime from the DEEPSEEK_API_KEY environment variable and is never
+ * written into the per-run workspace.
+ */
+const DEEPSEEK_MODELS_JSON = {
+  providers: {
+    deepseek: {
+      baseUrl: "https://api.deepseek.com",
+    },
+  },
+} as const;
+
+async function injectModelRuntimeFiles(agentConfigDir: string): Promise<string> {
+  await ensureDir(agentConfigDir);
+  await writeJson(path.join(agentConfigDir, "models.json"), DEEPSEEK_MODELS_JSON);
+  const apiKey = process.env.DEEPSEEK_API_KEY?.trim();
+  if (!apiKey) throw new Error("DEEPSEEK_API_KEY is required for a model-backed run.");
+  return apiKey;
+}
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -63,6 +88,60 @@ export function lastAssistantText(messages: unknown[]): string {
 
 export function modelRequestLimitReached(completedRequests: number, maximumRequests: number): boolean {
   return completedRequests >= maximumRequests;
+}
+
+async function findUniqueRootDuckdb(repo: string): Promise<string | undefined> {
+  const entries = await readdir(repo, { withFileTypes: true });
+  const candidates: string[] = [];
+  for (const entry of entries) {
+    if (!entry.name.toLowerCase().endsWith(".duckdb")) continue;
+    const info = await lstat(path.join(repo, entry.name));
+    if (info.isFile()) candidates.push(entry.name);
+  }
+  return candidates.length === 1 ? toPosix(candidates[0]) : undefined;
+}
+
+type AgentStreamFunction = Awaited<ReturnType<typeof createAgentSession>>["session"]["agent"]["streamFunction"];
+
+interface RequestBudget {
+  maximumRequests: number;
+  requestCount: () => number;
+  onRequest: () => void;
+  onBudgetExhausted: () => void;
+}
+
+function abortError(): DOMException {
+  return new DOMException("The operation was aborted", "AbortError");
+}
+
+export function wrapModelStreamFunction(streamFunction: AgentStreamFunction, budget: RequestBudget): AgentStreamFunction {
+  return (model, context, streamOptions) => {
+    const transport = streamOptions?.fetch ?? globalThis.fetch;
+    const fetchWithBudget: typeof globalThis.fetch = async (input, init) => {
+      if (streamOptions?.signal?.aborted || init?.signal?.aborted) throw abortError();
+      if (budget.requestCount() >= budget.maximumRequests) {
+        budget.onBudgetExhausted();
+        throw abortError();
+      }
+      budget.onRequest();
+      return transport(input, init);
+    };
+    return streamFunction(model, context, { ...streamOptions, fetch: fetchWithBudget });
+  };
+}
+
+export async function selectFinalArtifactResponse(options: {
+  workspaceRepo: string;
+  stopReason: string;
+  explicitResponse: string;
+}): Promise<string> {
+  const response = options.explicitResponse.trim();
+  if (response === "NO_ARTIFACT") return options.explicitResponse;
+  if (response && await hasValidSubmissionArtifact(options.workspaceRepo, response)) return options.explicitResponse;
+  if (options.stopReason === "agent_end" || options.stopReason === "model_request_limit" || options.stopReason === "wall_clock_timeout") {
+    return await findUniqueRootDuckdb(options.workspaceRepo) ?? options.explicitResponse;
+  }
+  return options.explicitResponse;
 }
 
 function collectTokenUsage(messages: unknown[]): AgentExecutionResult["tokenUsage"] {
@@ -164,6 +243,7 @@ export async function runAgent(options: {
   }, options.config.limits.wallClockMs);
 
   try {
+    const apiKey = await injectModelRuntimeFiles(options.workspace.agentConfigDir);
     const modelRuntime = await ModelRuntime.create({
       authPath: path.join(options.workspace.agentConfigDir, "auth.json"),
       modelsPath: path.join(options.workspace.agentConfigDir, "models.json"),
@@ -171,6 +251,7 @@ export async function runAgent(options: {
       refreshOnCreate: false,
       allowModelNetwork: false,
     });
+    await modelRuntime.setRuntimeApiKey("deepseek", apiKey);
     const thinking = options.config.thinking as ThinkingLevel;
     const resolution = resolveCliModel({ cliModel: options.config.model, cliThinking: thinking, modelRuntime });
     if (resolution.error || !resolution.model) throw new Error(resolution.error ?? `Model not found: ${options.config.model}`);
@@ -214,17 +295,28 @@ export async function runAgent(options: {
       settingsManager,
     });
     session = result.session;
+    session.agent.streamFunction = wrapModelStreamFunction(session.agent.streamFunction, {
+      maximumRequests: options.config.limits.maxModelRequestAttempts,
+      requestCount: () => modelRequestAttempts,
+      onRequest: () => {
+        modelRequestAttempts += 1;
+      },
+      onBudgetExhausted: () => {
+        if (stopReason === "agent_end") stopReason = "model_request_limit";
+        abortController.abort();
+        void session?.abort().catch(() => undefined);
+      },
+    });
     session.subscribe((event) => {
       const eventRecord = event as unknown as Record<string, unknown>;
       recordEvent(events, String(eventRecord.type ?? "unknown"), eventRecord);
       const eventType = String(eventRecord.type ?? "");
       const message = asRecord(eventRecord.message);
-      if (eventType === "message_start" && message.role === "assistant") {
-        modelRequestAttempts += 1;
-      }
       if ((eventType === "message_start" || eventType === "message_end") && !modelErrorObserved) {
         const messageError = assistantMessageError(message);
-        if (messageError) {
+        const messageStopReason = String(message.stopReason ?? message.stop_reason ?? "").toLowerCase();
+        const expectedAbort = (stopReason === "model_request_limit" || stopReason === "wall_clock_timeout") && messageStopReason === "aborted";
+        if (messageError && !expectedAbort) {
           modelErrorObserved = true;
           errorMessage = truncateText(messageError, 4_000);
           recordEvent(events, "model_error", {
@@ -246,19 +338,24 @@ export async function runAgent(options: {
       if (eventType === "auto_retry_start") retryAttempts += 1;
       if (eventType === "agent_end" && stopReason === "agent_end") stopReason = "agent_end";
     });
-    const prompt = `Task instance_id: ${options.instanceId}\n\nInstruction:\n${options.taskInstruction}\n\nFollow the fixed system prompt. Inspect the visible repository, implement the requested dbt changes, validate with dbt_build, and finish with exactly one artifact path or NO_ARTIFACT.`;
+    const prompt = `Task instance_id: ${options.instanceId}\n\nInstruction:\n${options.taskInstruction}\n\nFollow the fixed system prompt. Inspect the visible repository, implement the requested dbt changes, validate with dbt_build, and finish with exactly one relative .duckdb artifact path or NO_ARTIFACT.`;
     await session.prompt(prompt, { preflightResult: (accepted) => {
       if (!accepted && stopReason === "agent_end") stopReason = "agent_error";
     } });
     await session.waitForIdle();
   } catch (error) {
-    if (stopReason === "agent_end") stopReason = "agent_error";
-    if (!errorMessage) errorMessage = error instanceof Error ? error.message : String(error);
-    recordEvent(events, "runner_error", { details: { message: errorMessage } });
+    const expectedStop = stopReason === "model_request_limit" || stopReason === "wall_clock_timeout";
+    if (!expectedStop && stopReason === "agent_end") stopReason = "agent_error";
+    if (!expectedStop && !errorMessage) errorMessage = error instanceof Error ? error.message : String(error);
+    if (!expectedStop) recordEvent(events, "runner_error", { details: { message: errorMessage ?? String(error) } });
   }
 
-  const normalTermination = stopReason === "agent_end" && !errorMessage && !modelErrorObserved;
-  const finalResponse = normalTermination && session ? lastAssistantText(session.messages as unknown[]) : "";
+  const submittableStop = stopReason === "agent_end" || stopReason === "model_request_limit" || stopReason === "wall_clock_timeout";
+  let finalResponse = "";
+  if (submittableStop) {
+    const explicitResponse = session && !errorMessage && !modelErrorObserved ? lastAssistantText(session.messages as unknown[]) : "";
+    finalResponse = await selectFinalArtifactResponse({ workspaceRepo: options.workspace.repo, stopReason, explicitResponse });
+  }
   const tokenUsage = session ? collectTokenUsage(session.messages as unknown[]) : undefined;
   if (session) {
     session.dispose();

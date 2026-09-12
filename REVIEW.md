@@ -1,38 +1,32 @@
-# 首阶段代码审查
+# 当前审查与修复计划
 
-审查日期：2026-09-11
-审查角色：代码审计者，负责核对当前实现是否与既定目标一致、是否存在过度设计；不参与项目方向决策。
+更新：2026-09-12。基于当前代码、18 项通过的测试及独立离线反例。已完成项和旧审查结论已删除；当前只剩一项 P1。
 
-## 结论
+## P1：非预期 instance_id 会阻断合法项评分
 
-当前主结构与最小 Pi Agent SDK DataAgent 目标一致，未发现新增服务、跨任务记忆、多 Agent、语义层或 DAG 平台等越界设计。
+位置：`src/submission.ts` 的 `validateRoundResultDirectory`，以及 `src/evaluator.ts` 的 `evaluateRound`。
 
-当前仍不具备正式执行 18 次实验的条件。只保留以下两项有效发现：一项阻塞候选集生成，一项使无模型预检无法证明真实 dbt 运行环境可用。
+当前已经能逐项排除 SQL、CSV、缺失文件等无效产物，但 `expectedInstanceIds` 之外的合法 DuckDB 仍被加入全局 `problems`。`evaluateRound` 遇到任何全局问题都会设置 `setupError` 并跳过官方评分器，因此一个非预期任务仍会使所有合法预期任务变成 `scoring_unavailable`。
 
-## 1. [P1] 人工范围确认没有受支持的回填入口，候选集无法完成
+离线反例：metadata 同时包含一个预期任务 DuckDB 和一个非预期任务 DuckDB，结果为 `status=failed`、`failure_label=submission_or_gold_format`、`evaluated_runs=null`，预期任务未进入评分。
 
-位置：`src/selection.ts:263-268`、`src/selection.ts:332-362`、`src/selection.ts:508-569`、`src/cli.ts`
+### 明确修复措施
 
-当任务描述不能精确命中模型文件名时，当前实现把任务标记为 `manual_scope_confirmation_required` 并排除；但 CLI 和选择文件加载逻辑都没有接收、校验人工确认结果的入口。因此这不是可继续的人工检查点，而是流程死路。
+1. 在现有 `validateRoundResultDirectory` 内按 `expectedInstanceIds` 对已经通过文件校验的记录再次分组。非预期记录写入 `excluded`，原因为 `unexpected instance_id`；不要再写入全局 `problems`。
+2. 从 `metadataIds` 和 `validEntries` 中移除非预期记录，使 `createFilteredSubmissionDirectory` 只复制预期且合法的提交。原始 `results_metadata.jsonl` 保持不变。
+3. 保持 `evaluateRound` 的现有边界：有合法子集时只将临时过滤目录交给未修改的官方 evaluator；没有合法项时不调用 evaluator；`submission_exclusions` 保留每个排除项的 `instance_id` 和原因。
+4. 不新增模块、评分器、动态规则或恢复框架，不修改 gold、原始提交目录及官方 evaluator。
+5. 在 `test/contract.test.ts` 增加独立入口回归用例：一个预期 DuckDB 与一个非预期 DuckDB 混合，假 evaluator 必须只看到预期记录；同时断言预期项获得评分、非预期项进入 `submission_exclusions`、原始 metadata 仍保留两条记录。
 
-用官方本地任务列表和固定抽样配置实际运行 `prepare`：18 个样本中 16 个进入人工确认，另外 2 个缺少可见本地数据库，最终 `eligible=0`、`selected=0`、状态为 `incomplete`。即使补齐数据库，16 个任务仍无法进入选择结果，直接阻塞首阶段实验。
+### 验收标准
 
-最小修复：不要继续扩展自动分析器；增加一个很小的、可校验的人工范围映射输入，仅承载 `instance_id`、相关模型和必要观察结果，并由现有选择流程据此完成分层与抽样。
+- 上述混合反例返回 `status=completed`，预期项正常评分，非预期项不进入官方 evaluator。
+- 全部非预期或全部无效时不调用官方 evaluator，并保留排除原因。
+- 全部合法且属于预期任务时，行为与当前实现一致。
+- `npm run build`、全部现有测试及新增回归测试通过。
 
-## 2. [P2] dbt 预检只执行 `--version`，没有验证项目、profile 与 DuckDB 连接
+## 修复后的补评边界
 
-位置：`src/preflight.ts:203-301`
+P1 通过后，复用 tickit001、marketo001 的现存 DuckDB，在新目录（例如 `experiment-12/submission-recovery-1/`）仅对这两个产物补评。不重新调用模型、不重新执行 dbt、不修改数据库内容，也不覆盖原有结果、receipt、报告或成绩单。
 
-预检复制了任务项目并准备了隔离目录和环境变量，但实际受限命令只有 `dbt --version`。该命令不会加载 dbt 项目、解析 profile 或连接 DuckDB，因此即使预检通过，真实运行仍可能因项目、profile、适配器或数据库配置失败。
-
-最小修复：复用现有临时工作区和环境，仅把 smoke check 改成一次有超时限制的 `dbt debug`（指向对应 profile）；无需新增模块或抽象层。
-
-## 验证与证据边界
-
-- `npm run build` 通过；`npm test` 为 12/12 通过。
-- 独立复现已确认：父进程提前退出后，超时清理仍会终止脱离事件循环的后代进程。
-- 官方本地固定样本的真实选择结果为 0/18 可选，其中 16 项等待人工范围确认、2 项缺少可见数据库。
-- 当前机器没有可用的 `dbt`/`duckdb`，因此尚未执行真实 dbt 成功路径、模型调用或官方评分器调用。
-- 仓库没有可比较的提交历史；本审查针对当前工作区快照。
-
-修复顺序应为 1 → 2。完成后先验证候选集可稳定生成，再通过无模型 dbt 预检，之后才进入正式 9×2 实验。
+补评标记为“同一轮产物的提交修复”，不是新一轮 Agent 成绩。当前正式记录仍为 **1 成功、9 官方失败、2 未评分**；补评前不预设可追回分数。

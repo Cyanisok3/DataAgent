@@ -1,14 +1,14 @@
 # Data Engineering Agent
 
-这是按 `SCOPE.md`、`ARCHITECTURE.md` 和 `EXPERIMENT.md` 实现的首阶段 runner。实现只依赖 `DataAgent/` 自身；同级项目不是运行依赖。
+当前结构与实验约定见 `ARCHITECTURE.md` 和 `EXPERIMENT.md`。实现只依赖 `DataAgent/` 自身；同级项目不是运行依赖。
 
 ## 闭环
 
-1. `prepare` 从官方 task JSONL 复制任务描述，按固定种子做一次候选池抽样和轻量静态分层，输出 9 题清单。
-2. `preflight` 在不调用模型的情况下检查 Node、Python、dbt、DuckDB、SDK 和提交目录约束。
+1. `prepare` 从官方 task JSONL 复制任务描述，按固定种子抽取 12 题并输出 low/medium/high 为 3/6/3 的清单。
+2. `preflight` 在不调用模型的情况下检查固定 12 题协议、模型 `deepseek/deepseek-v4-flash`、thinking `off`、Node、Python、dbt、DuckDB、SDK 和提交目录约束。
 3. `experiment` 为每个任务建立新的 repo/数据库副本和内存会话，使用固定配置运行 Agent，记录工具事件、dbt 验证、diff 和 receipt，并把 gold/evaluator 留在 Agent 隔离边界之外。
-4. 每轮单独生成 `results_metadata.jsonl` 和提交产物，随后调用用户提供的官方 `evaluate.py`；两轮之间不传递评分或修改。
-5. `report` 汇总 18 个计划 run 的状态、两次官方结果和 dbt 状态；未评分项保留为未评分。
+4. 单轮生成 `results/round-1/results_metadata.jsonl` 和提交产物，随后调用用户提供的官方 `evaluate.py`。
+5. `report` 汇总 12 个计划 run 的状态、单次官方结果和 dbt 状态；未评分项保留为未评分。
 
 ## 安装
 
@@ -38,8 +38,8 @@ npm run dev -- prepare \
 npm run dev -- preflight \
   --selection /path/to/selection/selection.json \
   --experiment-root /path/to/experiment \
-  --model openai/<exact-model-id> \
-  --thinking medium \
+  --model deepseek/deepseek-v4-flash \
+  --thinking off \
   --evaluator /path/to/Spider2/spider2-dbt/evaluation_suite/evaluate.py \
   --gold-dir /path/to/Spider2/spider2-dbt/evaluation_suite/gold
 
@@ -47,8 +47,8 @@ npm run dev -- experiment \
   --selection /path/to/selection/selection.json \
   --examples-root /path/to/Spider2/spider2-dbt/examples \
   --output-root /path/to/experiment \
-  --model openai/<exact-model-id> \
-  --thinking medium \
+  --model deepseek/deepseek-v4-flash \
+  --thinking off \
   --evaluator /path/to/Spider2/spider2-dbt/evaluation_suite/evaluate.py \
   --gold-dir /path/to/Spider2/spider2-dbt/evaluation_suite/gold
 

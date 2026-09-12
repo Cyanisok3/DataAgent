@@ -12,6 +12,8 @@ const EXTERNAL_ADAPTERS = ["bigquery", "snowflake", "redshift", "postgres", "spa
 const FORBIDDEN_INPUT_DIRECTORIES = new Set(["gold", "reference", "references", "evaluation", "evaluations", "result", "results", "submission", "submissions", "output", "outputs"]);
 const NON_TASK_DIRECTORIES = new Set(["dbt_packages", "vendor", "packages", "tests", "test"]);
 const PROJECT_CONFIG_NAMES = new Set(["dbt_project.yml", "profiles.yml", "profiles.yaml", "packages.yml", "requirements.txt", "pyproject.toml"]);
+const FIXED_TASK_COUNT = 12;
+const FIXED_TIER_COUNTS: Record<Tier, number> = { low: 3, medium: 6, high: 3 };
 
 interface ScopeConfirmation {
   relatedModels: string[];
@@ -66,7 +68,7 @@ function normalizeConfirmedModelPath(value: string, field: string): string {
   return normalized;
 }
 
-async function loadScopeConfirmations(
+export async function loadScopeConfirmations(
   scopeConfirmationPath: string,
   taskIds: Set<string>,
 ): Promise<Map<string, ScopeConfirmation>> {
@@ -402,7 +404,7 @@ async function readEntryText(entry: { absolutePath: string }): Promise<string> {
   }
 }
 
-async function analyzeTask(task: OfficialTask, examplesRoot: string, confirmation?: ScopeConfirmation): Promise<StaticAnalysis> {
+export async function analyzeTask(task: OfficialTask, examplesRoot: string, confirmation?: ScopeConfirmation): Promise<StaticAnalysis> {
   const projectDirectory = await locateProjectDirectory(examplesRoot, task.instance_id);
   if (!projectDirectory) {
     const row: SelectionRow = {
@@ -598,11 +600,7 @@ function constraintIndicators(instruction: string, projectText: string): string[
 }
 
 function splitIntoThree<T>(items: T[]): [T[], T[], T[]] {
-  const base = Math.floor(items.length / 3);
-  const remainder = items.length % 3;
-  const firstLength = base + (remainder > 0 ? 1 : 0);
-  const secondLength = base + (remainder > 1 ? 1 : 0);
-  return [items.slice(0, firstLength), items.slice(firstLength, firstLength + secondLength), items.slice(firstLength + secondLength)];
+  return [items.slice(0, 3), items.slice(3, 9), items.slice(9, 12)];
 }
 
 export async function prepareSelection(options: {
@@ -615,8 +613,8 @@ export async function prepareSelection(options: {
   const taskFile = path.resolve(options.taskFile);
   const examplesRoot = path.resolve(options.examplesRoot);
   const outputDir = path.resolve(options.outputDir);
-  const poolSize = options.poolSize ?? 18;
-  if (poolSize <= 0 || poolSize > 18) throw new Error("The selection pool size must be between 1 and 18 for this protocol.");
+  const poolSize = options.poolSize ?? FIXED_TASK_COUNT;
+  if (poolSize !== FIXED_TASK_COUNT) throw new Error(`The fixed protocol requires exactly ${FIXED_TASK_COUNT} selected tasks.`);
   await ensureDir(outputDir);
   const selectionPath = path.join(outputDir, "selection.json");
   if (await fileExists(selectionPath)) throw new Error(`Selection output already exists: ${selectionPath}`);
@@ -642,14 +640,9 @@ export async function prepareSelection(options: {
   if (excluded.length > 0) limitations.push(`${excluded.length} sampled tasks were excluded by the local dbt/DuckDB eligibility checks`);
   const manualScopeCount = analyses.filter((item) => item.exclusionReason?.includes("manual candidate-pool confirmation")).length;
   if (manualScopeCount > 0) limitations.push(`${manualScopeCount} sampled tasks require one-time manual candidate-pool confirmation; automatic model-scope inference was not used`);
-  if (eligible.length < 9) limitations.push(`only ${eligible.length} eligible tasks remain; fewer than the required 9 tasks`);
+  if (eligible.length < FIXED_TASK_COUNT) limitations.push(`only ${eligible.length} eligible tasks remain; fewer than the required ${FIXED_TASK_COUNT} tasks`);
   const groups = splitIntoThree(eligible);
-  const groupScoreRanges = groups.map((group) => (group.length > 0 ? [group[0].totalScore, group[group.length - 1].totalScore] : []));
-  const distinctScores = new Set(eligible.map((item) => item.totalScore));
-  if (distinctScores.size < 3 && (groupScoreRanges[0]?.[0] ?? 0) === (groupScoreRanges[2]?.[1] ?? 0)) {
-    limitations.push("the eligible pool does not show three discernible structural score levels");
-  }
-  const status = limitations.some((item) => item.includes("manual candidate-pool confirmation") || item.includes("fewer than the required 9") || item.includes("does not show three discernible")) ? "incomplete" : "ready";
+  const status = limitations.some((item) => item.includes("manual candidate-pool confirmation") || item.includes(`fewer than the required ${FIXED_TASK_COUNT}`)) ? "incomplete" : "ready";
   const tiers: Record<Tier, string[]> = { low: [], medium: [], high: [] };
   let selected: Array<StaticAnalysis & { instruction: string }> = [];
   const tierNames: Tier[] = ["low", "medium", "high"];
@@ -658,7 +651,7 @@ export async function prepareSelection(options: {
   }
   if (status === "ready") {
     for (let index = 0; index < groups.length; index += 1) {
-      const chosen = pythonSeedSample(groups[index], 3);
+      const chosen = pythonSeedSample(groups[index], FIXED_TIER_COUNTS[tierNames[index]]);
       for (const item of chosen) {
         const task = tasks.find((candidate) => candidate.instance_id === item.row.instance_id);
         if (!task) throw new Error(`Task disappeared while selecting ${item.row.instance_id}`);
@@ -702,13 +695,26 @@ export async function loadSelection(selectionPath: string): Promise<SelectionMan
   const manifest = JSON.parse(await readFile(selectionPath, "utf8")) as SelectionManifest;
   if (manifest.schema_version !== "1.0" || manifest.seed !== SELECTION_SEED) throw new Error("Selection manifest is not compatible with the fixed protocol.");
   if (manifest.status !== "ready") throw new Error(`Selection is incomplete: ${manifest.limitations.join("; ")}`);
-  if (manifest.selected.length !== 9) throw new Error(`Selection must contain exactly 9 tasks, found ${manifest.selected.length}.`);
-  for (const tier of ["low", "medium", "high"] as Tier[]) {
-    if (manifest.tiers[tier].length !== 3) throw new Error(`Selection tier ${tier} must contain exactly 3 tasks.`);
+  if (!Array.isArray(manifest.candidate_pool) || !Array.isArray(manifest.selected) || !manifest.tiers || typeof manifest.tiers !== "object" ||
+    manifest.requested_pool_size !== FIXED_TASK_COUNT || manifest.sampled_pool_size !== FIXED_TASK_COUNT || manifest.candidate_pool.length !== FIXED_TASK_COUNT || manifest.selected.length !== FIXED_TASK_COUNT) {
+    throw new Error(`Selection must contain exactly ${FIXED_TASK_COUNT} sampled and selected tasks.`);
   }
-  if (manifest.scope_confirmation_path) {
-    const taskRows = await readJsonl<OfficialTask>(manifest.task_source.copied_to);
-    await loadScopeConfirmations(manifest.scope_confirmation_path, new Set(taskRows.map((task) => task.instance_id)));
+  const tierNames = ["low", "medium", "high"] as const;
+  if (!tierNames.every((tier) => Array.isArray(manifest.tiers[tier]) && manifest.tiers[tier].length === FIXED_TIER_COUNTS[tier])) {
+    throw new Error("Selection tiers must contain exactly 3 low, 6 medium, and 3 high tasks.");
   }
+  const selectedIds = manifest.selected.map((item) => item.row.instance_id);
+  const candidateIds = manifest.candidate_pool.map((item) => item.row.instance_id);
+  const tierIds = tierNames.flatMap((tier) => manifest.tiers[tier]);
+  if (new Set(candidateIds).size !== FIXED_TASK_COUNT || new Set(selectedIds).size !== FIXED_TASK_COUNT || new Set(tierIds).size !== FIXED_TASK_COUNT ||
+    selectedIds.some((id) => !candidateIds.includes(id)) || tierIds.some((id) => !selectedIds.includes(id))) {
+    throw new Error("Selection contains duplicate or inconsistent task IDs.");
+  }
+  const tierById = new Map(tierNames.flatMap((tier) => manifest.tiers[tier].map((id) => [id, tier] as const)));
+  if (manifest.selected.some((item) => tierById.get(item.row.instance_id) !== item.row.tier)) throw new Error("Selection task tiers do not match the tier ID lists.");
+  const taskRows = await readJsonl<OfficialTask>(manifest.task_source.copied_to);
+  const taskIds = taskRows.map((task) => task.instance_id);
+  if (new Set(taskIds).size !== taskIds.length || selectedIds.some((id) => !taskIds.includes(id))) throw new Error("Selection task IDs do not match the copied task list.");
+  if (manifest.scope_confirmation_path) await loadScopeConfirmations(manifest.scope_confirmation_path, new Set(taskIds));
   return manifest;
 }

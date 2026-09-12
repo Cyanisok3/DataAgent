@@ -5,29 +5,52 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { loadSelection, pythonSeedSample, prepareSelection } from "../src/selection.js";
 import { existingPathWithin, fileExists, walkFiles } from "../src/files.js";
-import { buildSubmission, validateRoundResultDirectory, writeRoundMetadata } from "../src/submission.js";
+import { buildSubmission, hasValidSubmissionArtifact, validateRoundResultDirectory, writeRoundMetadata } from "../src/submission.js";
 import { runExperiment } from "../src/experiment.js";
 import { markNotStarted, type ExperimentPlan } from "../src/experiment.js";
 import { writeDiagnosticReport } from "../src/report.js";
 import { evaluateRound } from "../src/evaluator.js";
-import { assistantMessageError, lastAssistantText, modelRequestLimitReached } from "../src/agent.js";
+import { assistantMessageError, lastAssistantText, modelRequestLimitReached, selectFinalArtifactResponse, wrapModelStreamFunction } from "../src/agent.js";
 import { runCommand, runRestrictedCommand, safeChildEnv } from "../src/process.js";
 import { validationStatus } from "../src/receipt.js";
-import type { RunReceipt } from "../src/types.js";
+import type { FixedAgentConfig, RunReceipt } from "../src/types.js";
+import { createSafeTools } from "../src/safe-tools.js";
+import { createFixedConfig } from "../src/config.js";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+
+function toolText(result: unknown): string {
+  const content = (result as { content?: Array<{ type?: string; text?: string }> }).content ?? [];
+  return content.filter((item) => item.type === "text").map((item) => item.text ?? "").join("");
+}
+
+function offlineToolConfig(): FixedAgentConfig {
+  return {
+    name: "test",
+    model: "test/model",
+    thinking: "off",
+    systemPromptPath: "",
+    systemPrompt: "",
+    tools: [],
+    sdk: { package: "test", version: "test", compactionEnabled: false, retryEnabled: false, maxRetries: 0 },
+    parameters: { temperature: "N/A: not exposed by the SDK session API", top_p: "N/A: not exposed by the SDK session API" },
+    limits: { wallClockMs: 10_000, maxModelRequestAttempts: 30, commandTimeoutMs: 10_000, evaluatorTimeoutMs: 10_000 },
+    commands: { python: "python3", dbt: "dbt", duckdb: "duckdb" },
+  };
+}
 
 test("fixed seed sampler matches Python random.Random.sample for the protocol seed", () => {
   const population = Array.from({ length: 69 }, (_, index) => index);
-  assert.deepEqual(pythonSeedSample(population, 18), [46, 1, 57, 11, 22, 52, 20, 31, 16, 8, 36, 48, 17, 66, 32, 5, 27, 24]);
+  assert.deepEqual(pythonSeedSample(population, 12), [46, 1, 57, 11, 22, 52, 20, 31, 16, 8, 36, 48]);
 });
 
-test("selection emits nine tasks with three relative tiers from a local-only pool", async () => {
+test("selection emits 12 tasks with a fixed 3/6/3 tier split from a local-only pool", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-selection-"));
   try {
     const examplesRoot = path.join(root, "examples");
     const outputDir = path.join(root, "selection");
     await mkdir(examplesRoot, { recursive: true });
     const tasks: string[] = [];
-    for (let index = 0; index < 18; index += 1) {
+    for (let index = 0; index < 12; index += 1) {
       const instanceId = `task-${String(index).padStart(2, "0")}`;
       const project = path.join(examplesRoot, instanceId);
       await mkdir(path.join(project, "models"), { recursive: true });
@@ -45,12 +68,28 @@ test("selection emits nine tasks with three relative tiers from a local-only poo
     }
     const taskFile = path.join(root, "tasks.jsonl");
     await writeFile(taskFile, `${tasks.join("\n")}\n`, "utf8");
-    const manifest = await prepareSelection({ taskFile, examplesRoot, outputDir, poolSize: 18 });
+    const manifest = await prepareSelection({ taskFile, examplesRoot, outputDir, poolSize: 12 });
     assert.equal(manifest.status, "ready");
-    assert.equal(manifest.sampled_pool_size, 18);
-    assert.equal(manifest.selected.length, 9);
-    assert.deepEqual(Object.fromEntries(Object.entries(manifest.tiers).map(([tier, ids]) => [tier, ids.length])), { low: 3, medium: 3, high: 3 });
-    assert.equal((await readFile(path.join(outputDir, "selected_tasks.jsonl"), "utf8")).trim().split("\n").length, 9);
+    assert.equal(manifest.sampled_pool_size, 12);
+    assert.equal(manifest.selected.length, 12);
+    assert.deepEqual(Object.fromEntries(Object.entries(manifest.tiers).map(([tier, ids]) => [tier, ids.length])), { low: 3, medium: 6, high: 3 });
+    assert.equal((await readFile(path.join(outputDir, "selected_tasks.jsonl"), "utf8")).trim().split("\n").length, 12);
+    assert.equal((await loadSelection(path.join(outputDir, "selection.json"))).selected.length, 12);
+    const malformedTiers = JSON.parse(await readFile(path.join(outputDir, "selection.json"), "utf8"));
+    malformedTiers.tiers.medium = malformedTiers.tiers.medium.slice(0, 5);
+    const malformedTiersPath = path.join(root, "selection-bad-tiers.json");
+    await writeFile(malformedTiersPath, JSON.stringify(malformedTiers), "utf8");
+    await assert.rejects(() => loadSelection(malformedTiersPath), /exactly 3 low, 6 medium, and 3 high/);
+    const oneTask = JSON.parse(await readFile(path.join(outputDir, "selection.json"), "utf8"));
+    oneTask.selected = oneTask.selected.slice(0, 1);
+    const oneTaskPath = path.join(root, "selection-one-task.json");
+    await writeFile(oneTaskPath, JSON.stringify(oneTask), "utf8");
+    await assert.rejects(() => loadSelection(oneTaskPath), /exactly 12 sampled and selected tasks/);
+    const duplicateIds = JSON.parse(await readFile(path.join(outputDir, "selection.json"), "utf8"));
+    duplicateIds.selected[1].row.instance_id = duplicateIds.selected[0].row.instance_id;
+    const duplicateIdsPath = path.join(root, "selection-duplicate-ids.json");
+    await writeFile(duplicateIdsPath, JSON.stringify(duplicateIds), "utf8");
+    await assert.rejects(() => loadSelection(duplicateIdsPath), /duplicate or inconsistent task IDs/);
 
     const confirmationPath = path.join(root, "scope-confirmations.jsonl");
     await writeFile(confirmationPath, `${JSON.stringify({
@@ -64,7 +103,7 @@ test("selection emits nine tasks with three relative tiers from a local-only poo
       taskFile,
       examplesRoot,
       outputDir: path.join(root, "selection-confirmed"),
-      poolSize: 18,
+      poolSize: 12,
       scopeConfirmationPath: confirmationPath,
     });
     assert.equal(confirmedManifest.status, "ready");
@@ -75,16 +114,35 @@ test("selection emits nine tasks with three relative tiers from a local-only poo
   }
 });
 
+test("fixed protocol rejects non-fixed model and thinking settings", () => {
+  assert.throws(() => createFixedConfig({ projectRoot: process.cwd(), model: "other/model", thinking: "off", systemPromptPath: "config/system-prompt.md", systemPrompt: "" }), /requires model deepseek\/deepseek-v4-flash/);
+  assert.throws(() => createFixedConfig({ projectRoot: process.cwd(), model: "deepseek\/deepseek-v4-flash", thinking: "medium", systemPromptPath: "config/system-prompt.md", systemPrompt: "" }), /requires thinking off/);
+});
+
 test("submission artifacts are copied into an official round directory and path escapes fail", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-submission-"));
   try {
     const repo = path.join(root, "repo");
     const resultDir = path.join(root, "results", "round-1");
     await mkdir(repo, { recursive: true });
+    await writeFile(path.join(repo, "answer.duckdb"), "fixture\n", "utf8");
+    await writeFile(path.join(repo, "answer.sql"), "select 1\n", "utf8");
     await writeFile(path.join(repo, "answer.csv"), "id,value\n1,ok\n", "utf8");
-    const submission = await buildSubmission({ instanceId: "task-01", finalResponse: "answer.csv", workspaceRepo: repo, roundResultDir: resultDir });
+    await writeFile(path.join(repo, "second.duckdb"), "fixture\n", "utf8");
+    await mkdir(path.join(repo, "artifact-directory"), { recursive: true });
+    const submission = await buildSubmission({ instanceId: "task-01", finalResponse: "answer.duckdb", workspaceRepo: repo, roundResultDir: resultDir });
     assert.equal(submission.record.answer_type, "file");
-    assert.equal(await readFile(path.join(resultDir, "task-01", "answer.csv"), "utf8"), "id,value\n1,ok\n");
+    assert.equal(await readFile(path.join(resultDir, "task-01", "answer.duckdb"), "utf8"), "fixture\n");
+    for (const [instanceId, finalResponse] of [
+      ["task-sql", "answer.sql"],
+      ["task-csv", "answer.csv"],
+      ["task-dir", "artifact-directory"],
+      ["task-multiple", "[\"answer.duckdb\",\"second.duckdb\"]"],
+    ] as const) {
+      const invalid = await buildSubmission({ instanceId, finalResponse, workspaceRepo: repo, roundResultDir: resultDir });
+      assert.equal(invalid.metadataEntry, undefined);
+      assert.equal(invalid.record.failure_label, "invalid_submission_artifact");
+    }
     const format = await validateRoundResultDirectory({ resultDir, expectedInstanceIds: ["task-01"] });
     assert.equal(format.ok, false);
     await writeFile(path.join(resultDir, "results_metadata.jsonl"), `${JSON.stringify(submission.metadataEntry)}\n`, "utf8");
@@ -110,7 +168,7 @@ test("task input symlinks are rejected by the isolation copy scanner", async () 
   }
 });
 
-test("experiment fails closed before model calls and records all 18 runs when preflight fails", async () => {
+test("experiment fails closed before model calls and records all 12 runs when preflight fails", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-preflight-"));
   try {
     const examplesRoot = path.join(root, "examples");
@@ -125,9 +183,9 @@ test("experiment fails closed before model calls and records all 18 runs when pr
     await writeFile(path.join(goldDir, "spider2_eval.jsonl"), "\n", "utf8");
     const selected: Array<Record<string, unknown>> = [];
     const tiers = { low: [] as string[], medium: [] as string[], high: [] as string[] };
-    for (let index = 0; index < 9; index += 1) {
+    for (let index = 0; index < 12; index += 1) {
       const instanceId = `preflight-${String(index).padStart(2, "0")}`;
-      const tier = index < 3 ? "low" : index < 6 ? "medium" : "high";
+      const tier = index < 3 ? "low" : index < 9 ? "medium" : "high";
       tiers[tier].push(instanceId);
       const project = path.join(examplesRoot, instanceId);
       await mkdir(path.join(project, "models"), { recursive: true });
@@ -158,8 +216,8 @@ test("experiment fails closed before model calls and records all 18 runs when pr
       seed: 20260911,
       task_source: { path: taskSource, official_url: "fixture", retrieved_on: "2026-09-11", copied_to: taskSource },
       examples_root: examplesRoot,
-      requested_pool_size: 18,
-      sampled_pool_size: 18,
+      requested_pool_size: 12,
+      sampled_pool_size: 12,
       candidate_pool: selected,
       excluded: [],
       tiers,
@@ -174,14 +232,14 @@ test("experiment fails closed before model calls and records all 18 runs when pr
       experimentRoot,
       evaluatorScript: evaluator,
       goldDir,
-      model: "fake/model",
-      thinking: "medium",
+      model: "deepseek/deepseek-v4-flash",
+      thinking: "off",
       dbtCommand: "dataagent-command-that-does-not-exist",
       duckdbCommand: "dataagent-duckdb-that-does-not-exist",
     });
     assert.equal(result.plan.status, "blocked");
-    assert.equal(result.plan.runs.length, 18);
-    assert.equal(result.plan.runs.filter((run) => run.status === "not_started").length, 18);
+    assert.equal(result.plan.runs.length, 12);
+    assert.equal(result.plan.runs.filter((run) => run.status === "not_started").length, 12);
     assert.equal(result.preflight.ok, false);
     const smokeCheck = result.preflight.checks.find((check) => check.name === "restricted_dbt_smoke");
     assert.equal(smokeCheck?.required, true);
@@ -189,7 +247,7 @@ test("experiment fails closed before model calls and records all 18 runs when pr
     assert.equal(smokeCheck?.command?.includes("debug"), true);
     assert.equal(await fileExists(path.join(experimentRoot, "plan.json")), true);
     const reportPath = await writeDiagnosticReport(experimentRoot);
-    assert.match(await readFile(reportPath, "utf8"), /9 tasks × 2 identical rounds = 18 planned runs/);
+    assert.match(await readFile(reportPath, "utf8"), /12 tasks, one run each = 12 planned runs/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -203,24 +261,114 @@ test("official evaluator adapter keeps evaluated, passed, and unavailable distin
     const evaluator = path.join(root, "evaluate.py");
     await mkdir(resultDir, { recursive: true });
     await mkdir(goldDir, { recursive: true });
-    await writeFile(path.join(resultDir, "results_metadata.jsonl"), `${JSON.stringify({ instance_id: "task-01", answer_type: "answer", answer_or_path: "ok" })}\n`, "utf8");
-    await writeFile(path.join(goldDir, "spider2_eval.jsonl"), `${JSON.stringify({ instance_id: "task-01", evaluation: { func: "string_match", parameters: {} } })}\n`, "utf8");
-    await writeFile(evaluator, "print('task-01')\nprint('1 1 1')\n", "utf8");
+    await mkdir(path.join(resultDir, "task-01"), { recursive: true });
+    await mkdir(path.join(resultDir, "task-02"), { recursive: true });
+    await mkdir(path.join(resultDir, "task-03"), { recursive: true });
+    await writeFile(path.join(resultDir, "task-01", "answer.duckdb"), "fixture\n", "utf8");
+    await writeFile(path.join(resultDir, "task-02", "answer.sql"), "select 1\n", "utf8");
+    await writeFile(path.join(resultDir, "task-03", "answer.duckdb"), "fixture\n", "utf8");
+    await writeFile(path.join(resultDir, "results_metadata.jsonl"), [
+      JSON.stringify({ instance_id: "task-01", answer_type: "file", answer_or_path: "answer.duckdb" }),
+      JSON.stringify({ instance_id: "task-02", answer_type: "file", answer_or_path: "answer.sql" }),
+      JSON.stringify({ instance_id: "task-03", answer_type: "file", answer_or_path: "answer.duckdb" }),
+      "",
+    ].join("\n"), "utf8");
+    await writeFile(path.join(goldDir, "spider2_eval.jsonl"), [
+      JSON.stringify({ instance_id: "task-01", evaluation: { func: "string_match", parameters: {} } }),
+      JSON.stringify({ instance_id: "task-02", evaluation: { func: "string_match", parameters: {} } }),
+      "",
+    ].join("\n"), "utf8");
+    await writeFile(evaluator, [
+      "import argparse, json",
+      "parser = argparse.ArgumentParser()",
+      "parser.add_argument('--result_dir')",
+      "parser.add_argument('--gold_dir')",
+      "args = parser.parse_args()",
+      "rows = [json.loads(line) for line in open(args.result_dir + '/results_metadata.jsonl') if line.strip()]",
+      "if len(rows) != 1 or rows[0].get('instance_id') != 'task-01' or any(row.get('answer_or_path') == 'answer.sql' for row in rows): raise SystemExit('filtered submission is incorrect')",
+      "print('task-01')",
+      "print('1 1 1')",
+      "",
+    ].join("\n"), "utf8");
     const evaluation = await evaluateRound({
-      round: 1,
       resultDir,
       goldDir,
       evaluatorScript: evaluator,
       pythonCommand: "python3",
       timeoutMs: 10_000,
-      expectedInstanceIds: ["task-01", "missing-task"],
+      expectedInstanceIds: ["task-01", "task-02"],
       logPath: path.join(root, "logs", "evaluator.log"),
     });
     assert.equal(evaluation.status, "completed");
     assert.equal(evaluation.score, 1);
     assert.deepEqual(evaluation.task_scores, [
       { instance_id: "task-01", score: 1, status: "passed" },
-      { instance_id: "missing-task", score: null, status: "not_evaluated" },
+      { instance_id: "task-02", score: null, status: "not_evaluated" },
+    ]);
+    assert.equal(evaluation.submission_exclusions.length, 2);
+    assert.equal(evaluation.submission_exclusions.find((item) => item.instance_id === "task-02")?.reason.includes(".duckdb"), true);
+    assert.equal(evaluation.submission_exclusions.find((item) => item.instance_id === "task-03")?.reason, "unexpected instance_id: task-03");
+    const originalMetadata = (await readFile(path.join(resultDir, "results_metadata.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(originalMetadata.length, 3);
+    assert.equal(originalMetadata[1]?.answer_or_path, "answer.sql");
+    assert.equal(originalMetadata[2]?.instance_id, "task-03");
+
+    const invalidResultDir = path.join(root, "invalid-results");
+    const invalidEvaluator = path.join(root, "invalid-evaluate.py");
+    const evaluatorMarker = path.join(root, "evaluator-called");
+    await mkdir(path.join(invalidResultDir, "task-02"), { recursive: true });
+    await writeFile(path.join(invalidResultDir, "task-02", "answer.sql"), "select 1\n", "utf8");
+    await writeFile(path.join(invalidResultDir, "results_metadata.jsonl"), `${JSON.stringify({ instance_id: "task-02", answer_type: "file", answer_or_path: "answer.sql" })}\n`, "utf8");
+    await writeFile(invalidEvaluator, `from pathlib import Path\nPath(${JSON.stringify(evaluatorMarker)}).write_text('called')\n`, "utf8");
+    const invalidEvaluation = await evaluateRound({
+      resultDir: invalidResultDir,
+      goldDir,
+      evaluatorScript: invalidEvaluator,
+      pythonCommand: "python3",
+      timeoutMs: 10_000,
+      expectedInstanceIds: ["task-02"],
+      logPath: path.join(root, "logs", "invalid-evaluator.log"),
+    });
+    assert.equal(invalidEvaluation.status, "completed");
+    assert.equal(invalidEvaluation.failure_label, "no_valid_submissions");
+    assert.equal(invalidEvaluation.exit_code, null);
+    assert.equal(invalidEvaluation.submission_exclusions.length, 1);
+    assert.equal(await fileExists(evaluatorMarker), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid DBT submissions are omitted while valid DuckDB submissions are scored", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-submission-mix-"));
+  try {
+    const repo = path.join(root, "repo");
+    const resultDir = path.join(root, "results");
+    const goldDir = path.join(root, "gold");
+    const evaluator = path.join(root, "evaluate.py");
+    await mkdir(repo, { recursive: true });
+    await mkdir(goldDir, { recursive: true });
+    await writeFile(path.join(repo, "valid.duckdb"), "fixture\n", "utf8");
+    await writeFile(path.join(repo, "invalid.sql"), "select 1\n", "utf8");
+    await writeFile(path.join(goldDir, "spider2_eval.jsonl"), `${JSON.stringify({ instance_id: "task-valid", evaluation: { func: "string_match", parameters: {} } })}\n`, "utf8");
+    await writeFile(evaluator, "print('task-valid')\nprint('1 1 1')\n", "utf8");
+    const valid = await buildSubmission({ instanceId: "task-valid", finalResponse: "valid.duckdb", workspaceRepo: repo, roundResultDir: resultDir });
+    const invalid = await buildSubmission({ instanceId: "task-invalid", finalResponse: "invalid.sql", workspaceRepo: repo, roundResultDir: resultDir });
+    assert.equal(invalid.record.failure_label, "invalid_submission_artifact");
+    await writeRoundMetadata(resultDir, [valid, invalid]);
+    const evaluation = await evaluateRound({
+      resultDir,
+      goldDir,
+      evaluatorScript: evaluator,
+      pythonCommand: "python3",
+      timeoutMs: 10_000,
+      expectedInstanceIds: ["task-valid", "task-invalid"],
+      logPath: path.join(root, "logs", "evaluator.log"),
+    });
+    assert.equal(evaluation.status, "completed");
+    assert.deepEqual(evaluation.task_scores, [
+      { instance_id: "task-valid", score: 1, status: "passed" },
+      { instance_id: "task-invalid", score: null, status: "not_evaluated" },
     ]);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -236,59 +384,197 @@ test("assistant errors are recorded as errors and a one-request budget permits t
   assert.equal(modelRequestLimitReached(1, 1), true);
 });
 
+test("text tools skip unreadable files and bound returned output", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-safe-tools-"));
+  try {
+    await writeFile(path.join(root, "a-large.json"), `{"needle":"${"x".repeat(5_000_001)}"}`, "utf8");
+    await writeFile(path.join(root, "b-binary.bin"), Buffer.from([0, ...Buffer.from("needle", "utf8")]));
+    await writeFile(path.join(root, "c-long.json"), `${"x".repeat(1_200)} needle ${"y".repeat(100)}\n`, "utf8");
+    await writeFile(path.join(root, "large.sql"), "select 1;\n".repeat(5_000), "utf8");
+    await writeFile(path.join(root, "zz-many-lines.sql"), ("needle " + "x".repeat(1_200) + "\n").repeat(100), "utf8");
+    await writeFile(path.join(root, "z-normal.sql"), "select 1 as needle;\n", "utf8");
+    await writeFile(path.join(root, "paged.sql"), "line 1\nline 2\nline 3\n", "utf8");
+    const tools = createSafeTools({ root, runtimeDir: path.join(root, "runtime"), config: offlineToolConfig(), remainingMs: () => 10_000, onDbtValidation: async () => undefined });
+    const execute = async (name: string, params: Record<string, unknown>) => {
+      const tool = tools.find((candidate) => candidate.name === name);
+      if (!tool) throw new Error(`missing tool ${name}`);
+      return tool.execute("test", params as never, undefined, undefined, undefined as never);
+    };
+
+    const readOutput = toolText(await execute("read_file", { path: "large.sql" }));
+    assert.ok(readOutput.length <= 32_000);
+    assert.match(readOutput, /output truncated/);
+    assert.match(readOutput, /select 1/);
+    assert.match(toolText(await execute("read_file", { path: "paged.sql", offset: 2, limit: 1 })), /line 2/);
+    assert.match(toolText(await execute("read_file", { path: "paged.sql", offset: 3, limit: 1 })), /line 3/);
+    await assert.rejects(() => execute("read_file", { path: "b-binary.bin" }), /Binary file detected/);
+
+    const boundedSearch = toolText(await execute("search_files", { path: "zz-many-lines.sql", pattern: "needle", literal: true, limit: 200 }));
+    assert.ok(boundedSearch.length <= 32_000);
+    assert.match(boundedSearch, /search output truncated/);
+    const searchOutput = toolText(await execute("search_files", { pattern: "needle", literal: true, limit: 10 }));
+    assert.ok(searchOutput.length <= 32_000);
+    assert.match(searchOutput, /c-long\.json:1:/);
+    assert.match(searchOutput, /z-normal\.sql:1:/);
+    assert.doesNotMatch(searchOutput, /a-large\.json/);
+    assert.doesNotMatch(searchOutput, /b-binary\.bin/);
+    const longMatch = searchOutput.split("\n").find((line) => line.startsWith("c-long.json:1: "));
+    assert.ok(longMatch);
+    assert.ok(longMatch.length <= 1_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime API keys stay in memory and out of the run config", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-runtime-auth-"));
+  try {
+    const configDir = path.join(root, "agent-config");
+    await mkdir(configDir, { recursive: true });
+    const authPath = path.join(configDir, "auth.json");
+    await writeFile(path.join(configDir, "models.json"), JSON.stringify({ providers: { deepseek: { baseUrl: "https://api.deepseek.com" } } }), "utf8");
+    const runtime = await ModelRuntime.create({
+      authPath,
+      modelsPath: path.join(configDir, "models.json"),
+      modelsStorePath: path.join(configDir, "models-store.json"),
+      refreshOnCreate: false,
+      allowModelNetwork: false,
+    });
+    await runtime.setRuntimeApiKey("deepseek", "fake-test-key");
+    assert.equal(runtime.getProviderAuthStatus("deepseek").source, "runtime");
+    assert.equal((await readFile(authPath, "utf8")).includes("fake-test-key"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("final artifact selection prefers explicit paths and only uniquely falls back on timeout", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-artifact-selection-"));
+  try {
+    const repo = path.join(root, "repo");
+    await mkdir(repo, { recursive: true });
+    await writeFile(path.join(repo, "input.duckdb"), "input\n", "utf8");
+    await writeFile(path.join(repo, "result.duckdb"), "result\n", "utf8");
+    await mkdir(path.join(repo, "nested"), { recursive: true });
+    await writeFile(path.join(repo, "nested", "cache.duckdb"), "cache\n", "utf8");
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "agent_end", explicitResponse: "result.duckdb" }), "result.duckdb");
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "agent_end", explicitResponse: "NO_ARTIFACT" }), "NO_ARTIFACT");
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "agent_end", explicitResponse: "../escape.duckdb" }), "../escape.duckdb");
+    assert.equal(await hasValidSubmissionArtifact(repo, "../escape.duckdb"), false);
+
+    await rm(path.join(repo, "result.duckdb"));
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "agent_end", explicitResponse: "main.fct_sales" }), "input.duckdb");
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "model_request_limit", explicitResponse: "" }), "input.duckdb");
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "agent_end", explicitResponse: "answer.sql" }), "input.duckdb");
+    await writeFile(path.join(repo, "result.duckdb"), "result\n", "utf8");
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "agent_end", explicitResponse: "main.fct_sales" }), "main.fct_sales");
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "wall_clock_timeout", explicitResponse: "" }), "");
+    await rm(path.join(repo, "input.duckdb"));
+    await rm(path.join(repo, "result.duckdb"));
+    assert.equal(await selectFinalArtifactResponse({ workspaceRepo: repo, stopReason: "wall_clock_timeout", explicitResponse: "" }), "");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("model request budget counts actual transport dispatches", async () => {
+  let requestCount = 0;
+  let dispatchCount = 0;
+  let budgetStops = 0;
+  const transport: typeof fetch = async () => {
+    dispatchCount += 1;
+    throw new Error("fake transport failure");
+  };
+  const base = (async (_model: unknown, _context: unknown, options?: { fetch?: typeof fetch }) => {
+    await options?.fetch?.("https://example.test");
+    return {};
+  }) as unknown as Parameters<typeof wrapModelStreamFunction>[0];
+  const wrapped = wrapModelStreamFunction(base, {
+    maximumRequests: 1,
+    requestCount: () => requestCount,
+    onRequest: () => { requestCount += 1; },
+    onBudgetExhausted: () => { budgetStops += 1; },
+  });
+  const invoke = (signal?: AbortSignal) => Promise.resolve(wrapped(undefined as never, undefined as never, { fetch: transport, signal } as never) as unknown as Promise<unknown>);
+
+  await assert.rejects(invoke(), /fake transport failure/);
+  assert.equal(requestCount, 1);
+  assert.equal(dispatchCount, 1);
+  await assert.rejects(invoke(), /aborted/);
+  assert.equal(requestCount, 1);
+  assert.equal(dispatchCount, 1);
+  assert.equal(budgetStops, 1);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(invoke(controller.signal), /aborted/);
+  assert.equal(requestCount, 1);
+  assert.equal(dispatchCount, 1);
+  assert.equal(budgetStops, 1);
+});
+
 test("selection ignores unrelated documentation and marks dynamic refs as unknown", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-selection-scope-"));
   try {
     const examplesRoot = path.join(root, "examples");
-    const project = path.join(examplesRoot, "scope-task");
+    const projectId = (index: number) => `scope-task-${String(index).padStart(2, "0")}`;
+    const project = path.join(examplesRoot, projectId(0));
     const taskFile = path.join(root, "tasks.jsonl");
-    await mkdir(path.join(project, "models"), { recursive: true });
-    await writeFile(path.join(project, "dbt_project.yml"), "name: scope_task\nprofile: local\n", "utf8");
-    await writeFile(path.join(project, "profiles.yml"), "local:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: data.duckdb\n", "utf8");
-    await writeFile(path.join(project, "data.duckdb"), "fixture\n", "utf8");
-    await writeFile(path.join(project, "models", "target.sql"), "select 1 as id\n", "utf8");
-    await writeFile(taskFile, `${JSON.stringify({ instance_id: "scope-task", instruction: "Update the target model", type: "DBT" })}\n`, "utf8");
-    const withoutDocumentation = await prepareSelection({ taskFile, examplesRoot, outputDir: path.join(root, "selection-a"), poolSize: 1 });
+    const tasks = Array.from({ length: 12 }, (_, index) => ({ instance_id: projectId(index), instruction: "Update the target model", type: "DBT" }));
+    for (const task of tasks) {
+      const taskProject = path.join(examplesRoot, task.instance_id);
+      await mkdir(path.join(taskProject, "models"), { recursive: true });
+      await writeFile(path.join(taskProject, "dbt_project.yml"), "name: scope_task\nprofile: local\n", "utf8");
+      await writeFile(path.join(taskProject, "profiles.yml"), "local:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: data.duckdb\n", "utf8");
+      await writeFile(path.join(taskProject, "data.duckdb"), "fixture\n", "utf8");
+      await writeFile(path.join(taskProject, "models", "target.sql"), "select 1 as id\n", "utf8");
+    }
+    await writeFile(taskFile, `${tasks.map((task) => JSON.stringify(task)).join("\n")}\n`, "utf8");
+    const analysisFor = (manifest: Awaited<ReturnType<typeof prepareSelection>>, instanceId: string) => {
+      const item = manifest.candidate_pool.find((candidate) => candidate.row.instance_id === instanceId);
+      assert.ok(item);
+      return item;
+    };
+    const withoutDocumentation = await prepareSelection({ taskFile, examplesRoot, outputDir: path.join(root, "selection-a"), poolSize: 12 });
     await writeFile(path.join(project, "README.md"), "unrelated documentation with join window timestamp\n", "utf8");
-    const withDocumentation = await prepareSelection({ taskFile, examplesRoot, outputDir: path.join(root, "selection-b"), poolSize: 1 });
-    assert.equal(withoutDocumentation.candidate_pool[0].row.scope_observations, withDocumentation.candidate_pool[0].row.scope_observations);
-    assert.equal(withoutDocumentation.candidate_pool[0].row.constraint_observations, withDocumentation.candidate_pool[0].row.constraint_observations);
+    const withDocumentation = await prepareSelection({ taskFile, examplesRoot, outputDir: path.join(root, "selection-b"), poolSize: 12 });
+    assert.equal(analysisFor(withoutDocumentation, projectId(0)).row.scope_observations, analysisFor(withDocumentation, projectId(0)).row.scope_observations);
+    assert.equal(analysisFor(withoutDocumentation, projectId(0)).row.constraint_observations, analysisFor(withDocumentation, projectId(0)).row.constraint_observations);
 
     const ambiguousTaskFile = path.join(root, "ambiguous-tasks.jsonl");
-    await writeFile(ambiguousTaskFile, `${JSON.stringify({ instance_id: "scope-task", instruction: "Update the business report", type: "DBT" })}\n`, "utf8");
-    const withoutUnrelatedModel = await prepareSelection({ taskFile: ambiguousTaskFile, examplesRoot, outputDir: path.join(root, "selection-d"), poolSize: 1 });
+    await writeFile(ambiguousTaskFile, `${tasks.map((task) => JSON.stringify({ ...task, instruction: "Update the business report" })).join("\n")}\n`, "utf8");
+    const withoutUnrelatedModel = await prepareSelection({ taskFile: ambiguousTaskFile, examplesRoot, outputDir: path.join(root, "selection-d"), poolSize: 12 });
     await writeFile(path.join(project, "models", "unrelated.sql"), "select * from {{ ref(model_name) }}\n", "utf8");
-    const withUnrelatedModel = await prepareSelection({ taskFile: ambiguousTaskFile, examplesRoot, outputDir: path.join(root, "selection-e"), poolSize: 1 });
-    assert.equal(withoutUnrelatedModel.candidate_pool[0].eligible, false);
-    assert.equal(withUnrelatedModel.candidate_pool[0].eligible, false);
-    assert.equal(withoutUnrelatedModel.candidate_pool[0].totalScore, withUnrelatedModel.candidate_pool[0].totalScore);
-    assert.equal(withoutUnrelatedModel.candidate_pool[0].row.dependency_observations, withUnrelatedModel.candidate_pool[0].row.dependency_observations);
-    assert.match(withUnrelatedModel.candidate_pool[0].row.selection_reason, /manual candidate-pool confirmation/);
+    const withUnrelatedModel = await prepareSelection({ taskFile: ambiguousTaskFile, examplesRoot, outputDir: path.join(root, "selection-e"), poolSize: 12 });
+    assert.equal(analysisFor(withoutUnrelatedModel, projectId(0)).eligible, false);
+    assert.equal(analysisFor(withUnrelatedModel, projectId(0)).eligible, false);
+    assert.equal(analysisFor(withoutUnrelatedModel, projectId(0)).totalScore, analysisFor(withUnrelatedModel, projectId(0)).totalScore);
+    assert.equal(analysisFor(withoutUnrelatedModel, projectId(0)).row.dependency_observations, analysisFor(withUnrelatedModel, projectId(0)).row.dependency_observations);
+    assert.match(analysisFor(withUnrelatedModel, projectId(0)).row.selection_reason, /manual candidate-pool confirmation/);
 
     const confirmationPath = path.join(root, "scope-confirmations.jsonl");
-    await writeFile(confirmationPath, `${JSON.stringify({
-      instance_id: "scope-task",
+    await writeFile(confirmationPath, `${tasks.map((task) => JSON.stringify({
+      instance_id: task.instance_id,
       related_models: ["models/target.sql"],
       scope_observations: "score=0; estimated_related_files=4; models=1; manual_scope_confirmed=true",
       dependency_observations: "score=0; visible_longest_chain_edges=0; branching=false; unknown=false; manual_scope_confirmed=true",
       constraint_observations: "score=0; indicators=none; manual_scope_confirmed=true",
-    })}\n`, "utf8");
+    })).join("\n")}\n`, "utf8");
     const confirmed = await prepareSelection({
       taskFile: ambiguousTaskFile,
       examplesRoot,
       outputDir: path.join(root, "selection-f"),
-      poolSize: 1,
+      poolSize: 12,
       scopeConfirmationPath: confirmationPath,
     });
-    assert.equal(confirmed.candidate_pool[0].eligible, true);
-    assert.deepEqual(confirmed.candidate_pool[0].modelFiles, ["models/target.sql"]);
-    assert.equal(confirmed.candidate_pool[0].row.scope_observations, "score=0; estimated_related_files=4; models=1; manual_scope_confirmed=true");
+    assert.equal(analysisFor(confirmed, projectId(0)).eligible, true);
+    assert.deepEqual(analysisFor(confirmed, projectId(0)).modelFiles, ["models/target.sql"]);
+    assert.equal(analysisFor(confirmed, projectId(0)).row.scope_observations, "score=0; estimated_related_files=4; models=1; manual_scope_confirmed=true");
     assert.equal(confirmed.scope_confirmation_path, path.join(root, "selection-f", "scope-confirmations.jsonl"));
     assert.equal(await fileExists(confirmed.scope_confirmation_path), true);
 
     const invalidConfirmationPath = path.join(root, "invalid-scope-confirmations.jsonl");
     await writeFile(invalidConfirmationPath, `${JSON.stringify({
-      instance_id: "scope-task",
+      instance_id: projectId(0),
       related_models: ["models/missing.sql"],
       scope_observations: "score=0; estimated_related_files=1",
       dependency_observations: "score=0; visible_longest_chain_edges=0; branching=false; unknown=false",
@@ -298,15 +584,15 @@ test("selection ignores unrelated documentation and marks dynamic refs as unknow
       taskFile: ambiguousTaskFile,
       examplesRoot,
       outputDir: path.join(root, "selection-g"),
-      poolSize: 1,
+      poolSize: 12,
       scopeConfirmationPath: invalidConfirmationPath,
     }), /references missing local model/);
 
     await writeFile(path.join(project, "models", "target.sql"), "select * from {{ ref(model_name) }}\n", "utf8");
-    const dynamicReference = await prepareSelection({ taskFile, examplesRoot, outputDir: path.join(root, "selection-c"), poolSize: 1 });
-    assert.equal(dynamicReference.candidate_pool[0].hasUnknownDependencies, true);
-    assert.match(dynamicReference.candidate_pool[0].row.dependency_observations, /unknown=true/);
-    assert.equal(dynamicReference.candidate_pool[0].eligible, false);
+    const dynamicReference = await prepareSelection({ taskFile, examplesRoot, outputDir: path.join(root, "selection-c"), poolSize: 12 });
+    assert.equal(analysisFor(dynamicReference, projectId(0)).hasUnknownDependencies, true);
+    assert.match(analysisFor(dynamicReference, projectId(0)).row.dependency_observations, /unknown=true/);
+    assert.equal(analysisFor(dynamicReference, projectId(0)).eligible, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -331,7 +617,7 @@ test("final dbt validation is authoritative while historical failures stay count
   assert.equal(validationStatus(undefined), "not_run");
 });
 
-test("process timeout terminates descendants and evaluator failure at round two has no invalid next index", async () => {
+test("process timeout terminates descendants and a failed evaluator leaves no invalid next index", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-process-timeout-"));
   try {
     const marker = path.join(root, "descendant-marker.txt");
@@ -353,7 +639,7 @@ test("process timeout terminates descendants and evaluator failure at round two 
     assert.equal(await fileExists(lateMarker), false);
 
     const plan = { runs: [{ status: "pending" }] } as unknown as ExperimentPlan;
-    assert.doesNotThrow(() => markNotStarted(plan, -1, "round two evaluator failed"));
+    assert.doesNotThrow(() => markNotStarted(plan, -1, "evaluator failed"));
     assert.equal(plan.runs[0].status, "pending");
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -383,7 +669,7 @@ test("restricted command never falls back to reading a marker outside the task r
   }
 });
 
-test("missing submissions are omitted and an empty round stays unscored", async () => {
+test("missing submissions are omitted and an empty result stays unscored", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-missing-submission-"));
   try {
     const repo = path.join(root, "repo");
@@ -403,7 +689,6 @@ test("missing submissions are omitted and an empty round stays unscored", async 
     assert.equal(directorySubmission.metadataEntry, undefined);
     await writeRoundMetadata(resultDir, [noArtifact, missingPath, directorySubmission]);
     const evaluation = await evaluateRound({
-      round: 1,
       resultDir,
       goldDir,
       evaluatorScript: evaluator,

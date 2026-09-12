@@ -5,3 +5,6 @@ artifacts/
 *.log
 *.duckdb
 *.db
+experiment-12*/
+selection-12/
+experiment-12*/runs/*/workspace/agent-config/auth.json

@@ -53,10 +53,10 @@ function printHelp(): void {
   console.log(`DataAgent diagnostic runner
 
 Commands:
-  prepare   --tasks FILE --examples-root DIR --output-dir DIR [--pool-size 18] [--scope-confirmation FILE]
+  prepare   --tasks FILE --examples-root DIR --output-dir DIR [--pool-size 12] [--scope-confirmation FILE]
   preflight --selection FILE --experiment-root DIR --evaluator FILE --gold-dir DIR --model ID --thinking LEVEL
   experiment --selection FILE --examples-root DIR --output-root DIR --model ID --thinking LEVEL --evaluator FILE --gold-dir DIR
-  evaluate  --round 1|2 --result-dir DIR --gold-dir DIR --evaluator FILE --selection FILE [--output FILE]
+  evaluate  --result-dir DIR --gold-dir DIR --evaluator FILE --selection FILE [--output FILE]
   report    --experiment-root DIR
 `);
 }
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
       taskFile: required(options, "tasks"),
       examplesRoot: required(options, "examples-root"),
       outputDir: required(options, "output-dir"),
-      poolSize: numberOption(options, "pool-size", 18),
+      poolSize: numberOption(options, "pool-size", 12),
       scopeConfirmationPath: optional(options, "scope-confirmation"),
     });
     console.log(JSON.stringify({ status: manifest.status, selected: manifest.selected.length, excluded: manifest.excluded.length, output_dir: path.resolve(required(options, "output-dir")) }, null, 2));
@@ -124,20 +124,17 @@ async function main(): Promise<void> {
     return;
   }
   if (options.command === "evaluate") {
-    const round = Number(required(options, "round"));
-    if (round !== 1 && round !== 2) throw new Error("--round must be 1 or 2");
     const selection = await loadSelection(required(options, "selection"));
     const resultDir = path.resolve(required(options, "result-dir"));
-    const output = path.resolve(optional(options, "output") ?? path.join(resultDir, "..", `evaluation-round-${round}.json`));
+    const output = path.resolve(optional(options, "output") ?? path.join(resultDir, "..", "evaluation.json"));
     const evaluation = await evaluateRound({
-      round,
       resultDir,
       goldDir: required(options, "gold-dir"),
       evaluatorScript: required(options, "evaluator"),
       pythonCommand: optional(options, "python") ?? "python3",
       timeoutMs: 10 * 60 * 1000,
       expectedInstanceIds: selection.selected.map((item) => item.row.instance_id),
-      logPath: path.resolve(optional(options, "log") ?? path.join(path.dirname(output), "evaluator-logs", `round-${round}.log`)),
+      logPath: path.resolve(optional(options, "log") ?? path.join(path.dirname(output), "evaluator-logs", "evaluator.log")),
     });
     await writeJson(output, evaluation);
     console.log(JSON.stringify({ status: evaluation.status, score: evaluation.score, evaluated: evaluation.evaluated_runs, output }, null, 2));

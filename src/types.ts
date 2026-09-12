@@ -139,8 +139,12 @@ export interface EvaluationTaskScore {
   status: "passed" | "failed" | "not_evaluated" | "scoring_unavailable";
 }
 
+export interface SubmissionExclusion {
+  instance_id?: string;
+  reason: string;
+}
+
 export interface EvaluationRecord {
-  round: 1 | 2;
   result_dir: string;
   gold_dir: string;
   evaluator_script: string;
@@ -155,6 +159,7 @@ export interface EvaluationRecord {
   successful_runs: number | null;
   evaluated_runs: number | null;
   task_scores: EvaluationTaskScore[];
+  submission_exclusions: SubmissionExclusion[];
   failure_label?: string;
 }
 
@@ -162,8 +167,6 @@ export interface RunReceipt {
   schema_version: "1.0";
   run_id: string;
   experiment_id: string;
-  round: 1 | 2;
-  repeat: 1 | 2;
   instance_id: string;
   tier: Tier;
   project: string;
@@ -224,8 +227,6 @@ export interface RunReceipt {
 
 export interface PlannedRun {
   run_id: string;
-  round: 1 | 2;
-  repeat: 1 | 2;
   instance_id: string;
   tier: Tier;
   project: string;

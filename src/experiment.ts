@@ -21,17 +21,14 @@ export interface ExperimentPlan {
   gold_dir: string;
   fixed_config: FixedAgentConfig;
   protocol: {
-    task_count: 9;
-    runs_per_task: 2;
-    total_runs: 18;
-    rounds: [1, 2];
+    task_count: number;
+    total_runs: number;
     same_task_order: true;
     fresh_workspace_per_run: true;
-    score_feedback_between_rounds: false;
   };
   preflight_path: string;
   runs: PlannedRun[];
-  evaluation_paths: Partial<Record<1 | 2, string>>;
+  evaluation_path?: string;
   block_reason?: string;
 }
 
@@ -57,22 +54,16 @@ function classifyError(error: unknown): { status: RunStatus; label: string; reas
 
 function initialRuns(manifest: SelectionManifest, experimentIdValue: string): PlannedRun[] {
   const selected = [...manifest.selected].sort((left, right) => left.row.instance_id.localeCompare(right.row.instance_id));
-  const runs: PlannedRun[] = [];
-  for (const round of [1, 2] as const) {
-    for (const [index, task] of selected.entries()) {
-      const instanceId = task.row.instance_id;
-      runs.push({
-        run_id: `${experimentIdValue}-r${round}-${String(index + 1).padStart(2, "0")}-${safeId(instanceId)}`,
-        round,
-        repeat: round,
-        instance_id: instanceId,
-        tier: task.row.tier as Tier,
-        project: task.row.project,
-        status: "pending",
-      });
-    }
-  }
-  return runs;
+  return selected.map((task, index) => {
+    const instanceId = task.row.instance_id;
+    return {
+      run_id: `${experimentIdValue}-r1-${String(index + 1).padStart(2, "0")}-${safeId(instanceId)}`,
+      instance_id: instanceId,
+      tier: task.row.tier as Tier,
+      project: task.row.project,
+      status: "pending",
+    };
+  });
 }
 
 async function writePlan(experimentRoot: string, plan: ExperimentPlan): Promise<void> {
@@ -83,7 +74,6 @@ async function writeFailureReceipt(options: {
   experimentId: string;
   planned: PlannedRun;
   runRoot: string;
-  roundResultDir: string;
   config: FixedAgentConfig;
   error: unknown;
 }): Promise<string> {
@@ -97,8 +87,6 @@ async function writeFailureReceipt(options: {
     schema_version: "1.0",
     run_id: options.planned.run_id,
     experiment_id: options.experimentId,
-    round: options.planned.round,
-    repeat: options.planned.repeat,
     instance_id: options.planned.instance_id,
     tier: options.planned.tier,
     project: options.planned.project,
@@ -234,17 +222,13 @@ export async function runExperiment(options: {
     gold_dir: path.resolve(options.goldDir),
     fixed_config: preflight.config,
     protocol: {
-      task_count: 9,
-      runs_per_task: 2,
-      total_runs: 18,
-      rounds: [1, 2],
+      task_count: selection.selected.length,
+      total_runs: selection.selected.length,
       same_task_order: true,
       fresh_workspace_per_run: true,
-      score_feedback_between_rounds: false,
     },
     preflight_path: path.join(experimentRoot, "preflight.json"),
     runs: initialRuns(selection, id),
-    evaluation_paths: {},
   };
   await writePlan(experimentRoot, plan);
   await copyFile(selection.task_source.copied_to, path.join(experimentRoot, "task-source.jsonl"));
@@ -257,99 +241,81 @@ export async function runExperiment(options: {
   }
 
   await retainEvaluatorCopy({ evaluatorScript: options.evaluatorScript, experimentRoot });
-  const submissionsByRound: Record<1 | 2, SubmissionBuildResult[]> = { 1: [], 2: [] };
+  const submissions: SubmissionBuildResult[] = [];
   let blocked = false;
   let blockReason = "";
-  for (const round of [1, 2] as const) {
+  const resultDir = path.join(experimentRoot, "results", "round-1");
+  await ensureDir(resultDir);
+  for (const planned of plan.runs) {
     if (blocked) {
-      for (const planned of plan.runs.filter((run) => run.round === round && (run.status === "pending" || run.status === "running"))) {
-        planned.status = "not_started";
-        planned.reason = blockReason;
-      }
-      await writePlan(experimentRoot, plan);
-      break;
+      planned.status = "not_started";
+      planned.reason = blockReason;
+      continue;
     }
-    const roundResultDir = path.join(experimentRoot, "results", `round-${round}`);
-    await ensureDir(roundResultDir);
-    const roundRuns = plan.runs.filter((run) => run.round === round);
-    for (const planned of roundRuns) {
-      if (blocked) {
-        planned.status = "not_started";
-        planned.reason = blockReason;
-        continue;
+    planned.status = "running";
+    await writePlan(experimentRoot, plan);
+    const sourceProject = path.resolve(plan.examples_root, planned.project);
+    const runRoot = path.join(experimentRoot, "runs", planned.run_id);
+    try {
+      const task = selection.selected.find((item) => item.row.instance_id === planned.instance_id);
+      if (!task) throw new Error(`Selected task disappeared: ${planned.instance_id}`);
+      const execution = await executeRun({
+        experimentId: plan.experiment_id,
+        runId: planned.run_id,
+        tier: planned.tier,
+        project: planned.project,
+        taskInstruction: task.instruction,
+        instanceId: planned.instance_id,
+        sourceProject,
+        runRoot,
+        roundResultDir: resultDir,
+        config: plan.fixed_config,
+      });
+      planned.status = execution.receipt.execution.run_status;
+      planned.receipt_path = path.join(runRoot, "receipt.json");
+      submissions.push(execution.submission);
+      if (planned.status === "environment_failed") {
+        blocked = true;
+        blockReason = `environment failure in ${planned.instance_id}; remaining runs were not started`;
       }
-      planned.status = "running";
-      await writePlan(experimentRoot, plan);
-      const sourceProject = path.resolve(plan.examples_root, planned.project);
-      const runRoot = path.join(experimentRoot, "runs", planned.run_id);
-      try {
-        const task = selection.selected.find((item) => item.row.instance_id === planned.instance_id);
-        if (!task) throw new Error(`Selected task disappeared: ${planned.instance_id}`);
-        const execution = await executeRun({
-          experimentId: plan.experiment_id,
-          runId: planned.run_id,
-          round,
-          repeat: round,
-          tier: planned.tier,
-          project: planned.project,
-          taskInstruction: task.instruction,
-          instanceId: planned.instance_id,
-          sourceProject,
-          runRoot,
-          roundResultDir,
-          config: plan.fixed_config,
-        });
-        planned.status = execution.receipt.execution.run_status;
-        planned.receipt_path = path.join(runRoot, "receipt.json");
-        submissionsByRound[round].push(execution.submission);
-        if (planned.status === "environment_failed") {
-          blocked = true;
-          blockReason = `environment failure in ${planned.instance_id}; remaining runs were not started`;
-        }
-      } catch (error) {
-        const classified = classifyError(error);
-        planned.status = classified.status;
-        planned.reason = classified.reason;
-        planned.receipt_path = await writeFailureReceipt({ experimentId: plan.experiment_id, planned, runRoot, roundResultDir, config: plan.fixed_config, error });
-        if (classified.status === "environment_failed") {
-          blocked = true;
-          blockReason = `environment failure in ${planned.instance_id}; remaining runs were not started`;
-        }
+    } catch (error) {
+      const classified = classifyError(error);
+      planned.status = classified.status;
+      planned.reason = classified.reason;
+      planned.receipt_path = await writeFailureReceipt({ experimentId: plan.experiment_id, planned, runRoot, config: plan.fixed_config, error });
+      if (classified.status === "environment_failed") {
+        blocked = true;
+        blockReason = `environment failure in ${planned.instance_id}; remaining runs were not started`;
       }
-      await writePlan(experimentRoot, plan);
     }
+    await writePlan(experimentRoot, plan);
+  }
 
-    for (const pending of plan.runs.filter((run) => run.round === round && run.status === "pending")) {
-      pending.status = "not_started";
-      pending.reason = blockReason || "not started after round execution";
-    }
-    await writeRoundMetadata(roundResultDir, submissionsByRound[round]);
-    const evaluation = await evaluateRound({
-      round,
-      resultDir: roundResultDir,
-      goldDir: plan.gold_dir,
-      evaluatorScript: plan.evaluator_script,
-      pythonCommand: plan.fixed_config.commands.python,
-      timeoutMs: plan.fixed_config.limits.evaluatorTimeoutMs,
-      expectedInstanceIds: selection.selected.map((item) => item.row.instance_id),
-      logPath: path.join(experimentRoot, "evaluator-logs", `round-${round}.log`),
-    });
-    const evaluationPath = path.join(experimentRoot, "evaluations", `round-${round}.json`);
-    await writeJson(evaluationPath, evaluation);
-    plan.evaluation_paths[round] = evaluationPath;
-    for (const planned of plan.runs.filter((run) => run.round === round && run.receipt_path)) {
-      await updateReceiptJudgment(planned.receipt_path!, evaluation);
-    }
-    if (evaluation.status !== "completed") {
-      blocked = true;
-      blockReason = `official evaluator ${evaluation.status}; later runs were not started`;
-      plan.status = "blocked";
-      plan.block_reason = blockReason;
-      const nextRoundIndex = plan.runs.findIndex((run) => run.round === round + 1);
-      markNotStarted(plan, nextRoundIndex, blockReason);
-      await writePlan(experimentRoot, plan);
-      break;
-    }
+  for (const pending of plan.runs.filter((run) => run.status === "pending")) {
+    pending.status = "not_started";
+    pending.reason = blockReason || "not started after experiment execution";
+  }
+  await writeRoundMetadata(resultDir, submissions);
+  const evaluation = await evaluateRound({
+    resultDir,
+    goldDir: plan.gold_dir,
+    evaluatorScript: plan.evaluator_script,
+    pythonCommand: plan.fixed_config.commands.python,
+    timeoutMs: plan.fixed_config.limits.evaluatorTimeoutMs,
+    expectedInstanceIds: selection.selected.map((item) => item.row.instance_id),
+    logPath: path.join(experimentRoot, "evaluator-logs", "round-1.log"),
+  });
+  const evaluationPath = path.join(experimentRoot, "evaluations", "round-1.json");
+  await writeJson(evaluationPath, evaluation);
+  plan.evaluation_path = evaluationPath;
+  for (const planned of plan.runs.filter((run) => run.receipt_path)) {
+    await updateReceiptJudgment(planned.receipt_path!, evaluation);
+  }
+  if (evaluation.status !== "completed") {
+    blocked = true;
+    blockReason = `official evaluator ${evaluation.status}; experiment is incomplete`;
+    plan.status = "blocked";
+    plan.block_reason = blockReason;
     await writePlan(experimentRoot, plan);
   }
 

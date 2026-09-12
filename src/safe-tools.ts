@@ -18,7 +18,23 @@ async function readTextAt(root: string, input: string): Promise<{ absolutePath: 
   const absolutePath = await safeReadPath(root, input);
   const info = await stat(absolutePath);
   if (!info.isFile()) throw new Error(`Not a file: ${input}`);
-  return { absolutePath, content: await readFile(absolutePath, "utf8") };
+  if (info.size > 5_000_000) {
+    throw new Error(`File too large to read as text (${info.size} bytes); inspect it with dbt_build or search_files instead.`);
+  }
+  const buffer = await readFile(absolutePath);
+  if (buffer.subarray(0, 8192).includes(0)) {
+    throw new Error(`Binary file detected (${input}); use dbt_build to inspect database contents instead of read_file.`);
+  }
+  return { absolutePath, content: buffer.toString("utf8") };
+}
+
+const MAX_TOOL_TEXT_CHARS = 32_000;
+const MAX_SEARCH_LINE_CHARS = 1_000;
+
+function truncateWithNotice(value: string, maxChars: number, notice: string): string {
+  if (value.length <= maxChars) return value;
+  const suffix = notice.slice(0, maxChars);
+  return `${value.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
 }
 
 function findLineRange(content: string, offset?: number, limit?: number): string {
@@ -28,7 +44,7 @@ function findLineRange(content: string, offset?: number, limit?: number): string
   const end = limit === undefined ? lines.length : Math.min(lines.length, start + Math.max(0, limit));
   let output = lines.slice(start, end).join("\n");
   if (end < lines.length) output += `\n\n[${lines.length - end} more lines; use offset=${end + 1}]`;
-  return output;
+  return truncateWithNotice(output, MAX_TOOL_TEXT_CHARS, "\n\n[output truncated at 32000 characters; use offset/limit to continue or narrow the file]");
 }
 
 function replaceExact(content: string, edits: Array<{ oldText: string; newText: string }>): string {
@@ -199,21 +215,28 @@ export function createSafeTools(options: {
       const limit = Math.min(200, Math.max(1, params.limit ?? 100));
       for (const file of files) {
         if (glob && !glob.test(toPosix(file.relativePath))) continue;
-        const content = await readFile(file.absolutePath, "utf8").catch(() => "");
-        if (content.includes("\u0000")) continue;
+        if (file.size > 5_000_000) continue;
+        const buffer = await readFile(file.absolutePath).catch(() => undefined);
+        if (!buffer || buffer.subarray(0, 8192).includes(0)) continue;
+        const content = buffer.toString("utf8");
         const lines = content.split(/\r?\n/);
         for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
           const line = lines[lineIndex];
           const haystack = params.ignoreCase ? line.toLowerCase() : line;
           const matched = pattern ? pattern.test(line) : haystack.includes(needle);
           if (!matched) continue;
-          matches.push(`${toPosix(file.relativePath)}:${lineIndex + 1}: ${line}`);
+          const prefix = `${toPosix(file.relativePath)}:${lineIndex + 1}: `;
+          matches.push(`${prefix}${truncateWithNotice(line, Math.max(0, MAX_SEARCH_LINE_CHARS - prefix.length), "…[line truncated]")}`);
           if (matches.length >= limit) break;
         }
         if (matches.length >= limit) break;
       }
       if (matches.length >= limit) matches.push(`[limit=${limit}]`);
-      return { content: [{ type: "text", text: matches.join("\n") || "No matches found" }], details: { path: params.path ?? "." } };
+      const output = matches.join("\n") || "No matches found";
+      return {
+        content: [{ type: "text", text: truncateWithNotice(output, MAX_TOOL_TEXT_CHARS, "\n[search output truncated at 32000 characters; narrow the path/pattern or lower limit]") }],
+        details: { path: params.path ?? "." },
+      };
     },
   });
 

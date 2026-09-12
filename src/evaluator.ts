@@ -1,12 +1,11 @@
 import { copyFile, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { ensureDir, fileExists, readJsonl, writeJson } from "./files.js";
+import { ensureDir, fileExists, readJsonl, removeIfExists, writeJson } from "./files.js";
 import { runCommand, safeChildEnv } from "./process.js";
-import { validateRoundResultDirectory } from "./submission.js";
-import type { EvaluationRecord, EvaluationTaskScore } from "./types.js";
+import { createFilteredSubmissionDirectory, validateRoundResultDirectory } from "./submission.js";
+import type { EvaluationRecord, EvaluationTaskScore, SubmissionExclusion } from "./types.js";
 
 export interface EvaluationOptions {
-  round: 1 | 2;
   resultDir: string;
   goldDir: string;
   evaluatorScript: string;
@@ -55,25 +54,39 @@ export async function evaluateRound(options: EvaluationOptions): Promise<Evaluat
   let submittedIds: string[] = [];
   let goldIdSet = new Set<string>();
   let setupError: string | undefined;
+  let submissionExclusions: SubmissionExclusion[] = [];
+  let evaluationResultDir = options.resultDir;
+  let filteredResultDir: string | undefined;
   try {
     const format = await validateRoundResultDirectory({ resultDir: options.resultDir, expectedInstanceIds: options.expectedInstanceIds });
-    if (!format.ok) throw new Error(format.problems.join("; "));
+    if (format.problems.length > 0) throw new Error(format.problems.join("; "));
     submittedIds = format.metadataIds;
+    submissionExclusions = format.excluded;
     goldIdSet = await goldIds(options.goldDir);
+    if (submissionExclusions.length > 0 && submittedIds.length > 0) {
+      filteredResultDir = await createFilteredSubmissionDirectory({ resultDir: options.resultDir, entries: format.validEntries });
+      evaluationResultDir = filteredResultDir;
+    }
   } catch (error) {
     setupError = error instanceof Error ? error.message : String(error);
   }
   const evaluatorDirectory = path.dirname(path.resolve(options.evaluatorScript));
-  const result = setupError
-    ? { command: [options.pythonCommand, options.evaluatorScript], started_at: startedAt, ended_at: new Date().toISOString(), duration_ms: 0, exit_code: null, timed_out: false, aborted: false, stdout: "", stderr: setupError }
-    : submittedIds.length === 0
-      ? { command: [options.pythonCommand, options.evaluatorScript], started_at: startedAt, ended_at: new Date().toISOString(), duration_ms: 0, exit_code: null, timed_out: false, aborted: false, stdout: "", stderr: "No valid submissions; official evaluator was not invoked." }
-      : await runCommand(options.pythonCommand, [options.evaluatorScript, "--result_dir", options.resultDir, "--gold_dir", options.goldDir], {
-      cwd: evaluatorDirectory,
-      env: safeChildEnv({ PYTHONPATH: evaluatorDirectory }),
-      timeoutMs: options.timeoutMs,
-      maxCapturedChars: 1_000_000,
-      });
+  const result = await (async () => {
+    try {
+      return setupError
+        ? { command: [options.pythonCommand, options.evaluatorScript], started_at: startedAt, ended_at: new Date().toISOString(), duration_ms: 0, exit_code: null, timed_out: false, aborted: false, stdout: "", stderr: setupError }
+        : submittedIds.length === 0
+          ? { command: [options.pythonCommand, options.evaluatorScript], started_at: startedAt, ended_at: new Date().toISOString(), duration_ms: 0, exit_code: null, timed_out: false, aborted: false, stdout: "", stderr: "No valid submissions; official evaluator was not invoked." }
+          : await runCommand(options.pythonCommand, [options.evaluatorScript, "--result_dir", evaluationResultDir, "--gold_dir", options.goldDir], {
+          cwd: evaluatorDirectory,
+          env: safeChildEnv({ PYTHONPATH: evaluatorDirectory }),
+          timeoutMs: options.timeoutMs,
+          maxCapturedChars: 1_000_000,
+          });
+    } finally {
+      if (filteredResultDir) await removeIfExists(filteredResultDir);
+    }
+  })();
   const logContent = `${result.command.join(" ")}\n\n[stdout]\n${result.stdout}\n\n[stderr]\n${result.stderr}\n`;
   await ensureDir(path.dirname(options.logPath));
   await writeFile(options.logPath, logContent, "utf8");
@@ -85,7 +98,6 @@ export async function evaluateRound(options: EvaluationOptions): Promise<Evaluat
   const endedAt = new Date().toISOString();
   const status = noValidSubmissions ? "completed" : result.timed_out || result.aborted ? "timed_out" : available ? "completed" : "failed";
   return {
-    round: options.round,
     result_dir: path.resolve(options.resultDir),
     gold_dir: path.resolve(options.goldDir),
     evaluator_script: path.resolve(options.evaluatorScript),
@@ -100,6 +112,7 @@ export async function evaluateRound(options: EvaluationOptions): Promise<Evaluat
     successful_runs: parsedSummary?.successful ?? (noValidSubmissions ? 0 : available ? successes.size : null),
     evaluated_runs: parsedSummary?.evaluated ?? (noValidSubmissions ? 0 : available ? evaluatedIds.size : null),
     task_scores: scoresFor({ expected: options.expectedInstanceIds, evaluatedIds, successes, scoringAvailable: available, noValidSubmissions }),
+    submission_exclusions: submissionExclusions,
     ...(setupError ? { failure_label: "submission_or_gold_format" } : noValidSubmissions ? { failure_label: "no_valid_submissions" } : result.timed_out ? { failure_label: "evaluator_timeout" } : !available ? { failure_label: "evaluator_failure" } : {}),
   };
 }
