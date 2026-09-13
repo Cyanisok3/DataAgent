@@ -23,6 +23,7 @@ export interface ExperimentPlan {
   protocol: {
     task_count: number;
     total_runs: number;
+    parallelism: number;
     same_task_order: true;
     fresh_workspace_per_run: true;
   };
@@ -187,9 +188,11 @@ export async function runExperiment(options: {
   pythonCommand?: string;
   dbtCommand?: string;
   duckdbCommand?: string;
+  parallelism?: number;
 }): Promise<ExperimentResult> {
   const projectRoot = path.resolve(options.projectRoot);
   const experimentRoot = path.resolve(options.experimentRoot);
+  const parallelism = Math.max(1, Math.floor(options.parallelism ?? 1));
   if (await fileExists(path.join(experimentRoot, "plan.json"))) throw new Error(`Experiment already exists: ${path.join(experimentRoot, "plan.json")}`);
   const selection = await loadSelection(options.selectionPath);
   if (options.examplesRoot && path.resolve(options.examplesRoot) !== path.resolve(selection.examples_root)) {
@@ -224,6 +227,7 @@ export async function runExperiment(options: {
     protocol: {
       task_count: selection.selected.length,
       total_runs: selection.selected.length,
+      parallelism,
       same_task_order: true,
       fresh_workspace_per_run: true,
     },
@@ -246,48 +250,51 @@ export async function runExperiment(options: {
   let blockReason = "";
   const resultDir = path.join(experimentRoot, "results", "round-1");
   await ensureDir(resultDir);
-  for (const planned of plan.runs) {
+  for (let index = 0; index < plan.runs.length; index += parallelism) {
+    const batch = plan.runs.slice(index, index + parallelism);
     if (blocked) {
-      planned.status = "not_started";
-      planned.reason = blockReason;
-      continue;
+      markNotStarted(plan, index, blockReason);
+      await writePlan(experimentRoot, plan);
+      break;
     }
-    planned.status = "running";
+    for (const planned of batch) planned.status = "running";
     await writePlan(experimentRoot, plan);
-    const sourceProject = path.resolve(plan.examples_root, planned.project);
-    const runRoot = path.join(experimentRoot, "runs", planned.run_id);
-    try {
-      const task = selection.selected.find((item) => item.row.instance_id === planned.instance_id);
-      if (!task) throw new Error(`Selected task disappeared: ${planned.instance_id}`);
-      const execution = await executeRun({
-        experimentId: plan.experiment_id,
-        runId: planned.run_id,
-        tier: planned.tier,
-        project: planned.project,
-        taskInstruction: task.instruction,
-        instanceId: planned.instance_id,
-        sourceProject,
-        runRoot,
-        roundResultDir: resultDir,
-        config: plan.fixed_config,
-      });
-      planned.status = execution.receipt.execution.run_status;
-      planned.receipt_path = path.join(runRoot, "receipt.json");
-      submissions.push(execution.submission);
-      if (planned.status === "environment_failed") {
-        blocked = true;
-        blockReason = `environment failure in ${planned.instance_id}; remaining runs were not started`;
+    await Promise.all(batch.map(async (planned) => {
+      const sourceProject = path.resolve(plan.examples_root, planned.project);
+      const runRoot = path.join(experimentRoot, "runs", planned.run_id);
+      try {
+        const task = selection.selected.find((item) => item.row.instance_id === planned.instance_id);
+        if (!task) throw new Error(`Selected task disappeared: ${planned.instance_id}`);
+        const execution = await executeRun({
+          experimentId: plan.experiment_id,
+          runId: planned.run_id,
+          tier: planned.tier,
+          project: planned.project,
+          taskInstruction: task.instruction,
+          instanceId: planned.instance_id,
+          sourceProject,
+          runRoot,
+          roundResultDir: resultDir,
+          config: plan.fixed_config,
+        });
+        planned.status = execution.receipt.execution.run_status;
+        planned.receipt_path = path.join(runRoot, "receipt.json");
+        submissions.push(execution.submission);
+        if (planned.status === "environment_failed") {
+          blocked = true;
+          blockReason = `environment failure in ${planned.instance_id}; remaining runs were not started`;
+        }
+      } catch (error) {
+        const classified = classifyError(error);
+        planned.status = classified.status;
+        planned.reason = classified.reason;
+        planned.receipt_path = await writeFailureReceipt({ experimentId: plan.experiment_id, planned, runRoot, config: plan.fixed_config, error });
+        if (classified.status === "environment_failed") {
+          blocked = true;
+          blockReason = `environment failure in ${planned.instance_id}; remaining runs were not started`;
+        }
       }
-    } catch (error) {
-      const classified = classifyError(error);
-      planned.status = classified.status;
-      planned.reason = classified.reason;
-      planned.receipt_path = await writeFailureReceipt({ experimentId: plan.experiment_id, planned, runRoot, config: plan.fixed_config, error });
-      if (classified.status === "environment_failed") {
-        blocked = true;
-        blockReason = `environment failure in ${planned.instance_id}; remaining runs were not started`;
-      }
-    }
+    }));
     await writePlan(experimentRoot, plan);
   }
 

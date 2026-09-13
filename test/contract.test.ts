@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -40,6 +40,91 @@ function offlineToolConfig(): FixedAgentConfig {
     parameters: { temperature: "N/A: not exposed by the SDK session API", top_p: "N/A: not exposed by the SDK session API" },
     limits: { wallClockMs: 10_000, maxModelRequestAttempts: 30, commandTimeoutMs: 10_000, evaluatorTimeoutMs: 10_000 },
     commands: { python: "python3", dbt: "dbt", duckdb: "duckdb" },
+  };
+}
+
+async function createExperimentFixture(root: string): Promise<{
+  examplesRoot: string;
+  selected: Array<Record<string, unknown>>;
+  experimentOptions: {
+    projectRoot: string;
+    selectionPath: string;
+    examplesRoot: string;
+    evaluatorScript: string;
+    goldDir: string;
+    model: string;
+    thinking: string;
+    dbtCommand: string;
+    duckdbCommand: string;
+  };
+}> {
+  const examplesRoot = path.join(root, "examples");
+  const selectionDir = path.join(root, "selection");
+  const taskSource = path.join(selectionDir, "official-task-list.jsonl");
+  const evaluator = path.join(root, "evaluate.py");
+  const goldDir = path.join(root, "gold");
+  await mkdir(selectionDir, { recursive: true });
+  await mkdir(goldDir, { recursive: true });
+  await writeFile(evaluator, "print('fake evaluator')\n", "utf8");
+  await writeFile(path.join(goldDir, "spider2_eval.jsonl"), "\n", "utf8");
+  const selected: Array<Record<string, unknown>> = [];
+  const tiers = { low: [] as string[], medium: [] as string[], high: [] as string[] };
+  for (let index = 0; index < 12; index += 1) {
+    const instanceId = `preflight-${String(index).padStart(2, "0")}`;
+    const tier = index < 3 ? "low" : index < 9 ? "medium" : "high";
+    tiers[tier].push(instanceId);
+    const project = path.join(examplesRoot, instanceId);
+    await mkdir(path.join(project, "models"), { recursive: true });
+    await writeFile(path.join(project, "dbt_project.yml"), "name: local\nprofile: local\n", "utf8");
+    await writeFile(path.join(project, "profiles.yml"), "local:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: data.duckdb\n", "utf8");
+    await writeFile(path.join(project, "data.duckdb"), "fixture\n", "utf8");
+    await writeFile(path.join(project, "models", "model.sql"), "select 1 as id\n", "utf8");
+    selected.push({
+      row: { instance_id: instanceId, project: instanceId, scope_observations: "score=0", dependency_observations: "score=0; unknown=false", constraint_observations: "score=0", tier, selection_reason: "fixture" },
+      eligible: true,
+      scopeScore: 0,
+      dependencyScore: 0,
+      constraintScore: 0,
+      totalScore: 0,
+      estimatedRelatedFiles: 4,
+      modelCount: 1,
+      visibleLongestDependencyChainEdges: 0,
+      hasUnknownDependencies: false,
+      databaseFiles: ["data.duckdb"],
+      modelFiles: ["models/model.sql"],
+      instruction: `Update ${instanceId}`,
+    });
+  }
+  await writeFile(taskSource, `${selected.map((item) => JSON.stringify({ instance_id: (item.row as { instance_id: string }).instance_id, instruction: item.instruction, type: "DBT" })).join("\n")}\n`, "utf8");
+  await writeFile(path.join(selectionDir, "selection.json"), `${JSON.stringify({
+    schema_version: "1.0",
+    created_on: new Date().toISOString(),
+    seed: 20260911,
+    task_source: { path: taskSource, official_url: "fixture", retrieved_on: "2026-09-11", copied_to: taskSource },
+    examples_root: examplesRoot,
+    requested_pool_size: 12,
+    sampled_pool_size: 12,
+    candidate_pool: selected,
+    excluded: [],
+    tiers,
+    selected,
+    limitations: [],
+    status: "ready",
+  }, null, 2)}\n`, "utf8");
+  return {
+    examplesRoot,
+    selected,
+    experimentOptions: {
+      projectRoot: path.resolve(process.cwd()),
+      selectionPath: path.join(selectionDir, "selection.json"),
+      examplesRoot,
+      evaluatorScript: evaluator,
+      goldDir,
+      model: "deepseek/deepseek-v4-flash",
+      thinking: "off",
+      dbtCommand: "dataagent-command-that-does-not-exist",
+      duckdbCommand: "dataagent-duckdb-that-does-not-exist",
+    },
   };
 }
 
@@ -347,6 +432,51 @@ test("dbt debug omits unsupported target arguments and rejects selectors", async
   }
 });
 
+test("dbt tool content preserves long stdout tail and stderr failure details", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-dbt-output-"));
+  try {
+    if (!await requireRestrictedBackend(t, root, path.join(root, "restricted-probe"))) return;
+    const dbtFixture = path.join(root, "dbt-output-fixture.sh");
+    await writeFile(dbtFixture, [
+      "#!/bin/sh",
+      "i=0",
+      "while [ \"$i\" -lt 4000 ]; do",
+      "  printf 'ordinary dbt output line %s\\n' \"$i\"",
+      "  i=$((i + 1))",
+      "done",
+      "printf '%s\\n' '[ERROR]: in test relationships_stg_synthea__claims_transactions_patient_insurance_id__member_id__ref_stg_synthea__payer_transitions_'",
+      "printf '%s\\n' '  Got 4598 results, configured to fail if != 0'",
+      "printf '%s\\n' 'Done. PASS=217 WARN=0 ERROR=1 SKIP=7 NO-OP=0 REUSED=0 TOTAL=225'",
+      "printf '%s\\n' 'Compiler Error: synthetic compile failure retained on stderr' >&2",
+      "exit 1",
+      "",
+    ].join("\n"), "utf8");
+    await chmod(dbtFixture, 0o755);
+    const config = offlineToolConfig();
+    config.commands.dbt = "./dbt-output-fixture.sh";
+    const validations: unknown[] = [];
+    const tools = createSafeTools({ root, runtimeDir: path.join(root, "runtime"), config, remainingMs: () => 10_000, onDbtValidation: async (record) => { validations.push(record); } });
+    const dbtBuild = tools.find((tool) => tool.name === "dbt_build");
+    assert.ok(dbtBuild);
+    const result = await dbtBuild.execute("test", { action: "build" }, undefined, undefined, undefined as never);
+    const details = toolDetails(result);
+    assert.equal(details.exit_code, 1);
+    assert.equal(details.timed_out, false);
+    assert.equal(details.aborted, false);
+    assert.ok(details.sandbox_backend === "macos-sandbox-exec" || details.sandbox_backend === "docker");
+    const content = toolText(result);
+    assert.ok(content.length <= 16_000);
+    assert.match(content, /relationships_stg_synthea__claims_transactions_patient_insurance_id__member_id__ref_stg_synthea__payer_transitions_/);
+    assert.match(content, /Got 4598 results/);
+    assert.match(content, /Done\. PASS=217 WARN=0 ERROR=1 SKIP=7 NO-OP=0 REUSED=0 TOTAL=225/);
+    assert.match(content, /Compiler Error: synthetic compile failure retained on stderr/);
+    assert.match(content, /partial dbt log shown; full record is available only for external audit/);
+    assert.equal(validations.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("task input symlinks are rejected by the isolation copy scanner", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-symlink-"));
   try {
@@ -364,74 +494,13 @@ test("task input symlinks are rejected by the isolation copy scanner", async () 
 test("experiment fails closed before model calls and records all 12 runs when preflight fails", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-preflight-"));
   try {
-    const examplesRoot = path.join(root, "examples");
-    const selectionDir = path.join(root, "selection");
-    const taskSource = path.join(selectionDir, "official-task-list.jsonl");
-    const evaluator = path.join(root, "evaluate.py");
-    const goldDir = path.join(root, "gold");
+    const fixture = await createExperimentFixture(root);
+    const { experimentOptions } = fixture;
     const experimentRoot = path.join(root, "experiment");
-    await mkdir(selectionDir, { recursive: true });
-    await mkdir(goldDir, { recursive: true });
-    await writeFile(evaluator, "print('fake evaluator')\n", "utf8");
-    await writeFile(path.join(goldDir, "spider2_eval.jsonl"), "\n", "utf8");
-    const selected: Array<Record<string, unknown>> = [];
-    const tiers = { low: [] as string[], medium: [] as string[], high: [] as string[] };
-    for (let index = 0; index < 12; index += 1) {
-      const instanceId = `preflight-${String(index).padStart(2, "0")}`;
-      const tier = index < 3 ? "low" : index < 9 ? "medium" : "high";
-      tiers[tier].push(instanceId);
-      const project = path.join(examplesRoot, instanceId);
-      await mkdir(path.join(project, "models"), { recursive: true });
-      await writeFile(path.join(project, "dbt_project.yml"), "name: local\nprofile: local\n", "utf8");
-      await writeFile(path.join(project, "profiles.yml"), "local:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: data.duckdb\n", "utf8");
-      await writeFile(path.join(project, "data.duckdb"), "fixture\n", "utf8");
-      await writeFile(path.join(project, "models", "model.sql"), "select 1 as id\n", "utf8");
-      selected.push({
-        row: { instance_id: instanceId, project: instanceId, scope_observations: "score=0", dependency_observations: "score=0; unknown=false", constraint_observations: "score=0", tier, selection_reason: "fixture" },
-        eligible: true,
-        scopeScore: 0,
-        dependencyScore: 0,
-        constraintScore: 0,
-        totalScore: 0,
-        estimatedRelatedFiles: 4,
-        modelCount: 1,
-        visibleLongestDependencyChainEdges: 0,
-        hasUnknownDependencies: false,
-        databaseFiles: ["data.duckdb"],
-        modelFiles: ["models/model.sql"],
-        instruction: `Update ${instanceId}`,
-      });
-    }
-    await writeFile(taskSource, `${selected.map((item) => JSON.stringify({ instance_id: (item.row as { instance_id: string }).instance_id, instruction: item.instruction, type: "DBT" })).join("\n")}\n`, "utf8");
-    await writeFile(path.join(selectionDir, "selection.json"), `${JSON.stringify({
-      schema_version: "1.0",
-      created_on: new Date().toISOString(),
-      seed: 20260911,
-      task_source: { path: taskSource, official_url: "fixture", retrieved_on: "2026-09-11", copied_to: taskSource },
-      examples_root: examplesRoot,
-      requested_pool_size: 12,
-      sampled_pool_size: 12,
-      candidate_pool: selected,
-      excluded: [],
-      tiers,
-      selected,
-      limitations: [],
-      status: "ready",
-    }, null, 2)}\n`, "utf8");
-    const result = await runExperiment({
-      projectRoot: path.resolve(process.cwd()),
-      selectionPath: path.join(selectionDir, "selection.json"),
-      examplesRoot,
-      experimentRoot,
-      evaluatorScript: evaluator,
-      goldDir,
-      model: "deepseek/deepseek-v4-flash",
-      thinking: "off",
-      dbtCommand: "dataagent-command-that-does-not-exist",
-      duckdbCommand: "dataagent-duckdb-that-does-not-exist",
-    });
+    const result = await runExperiment({ ...experimentOptions, experimentRoot });
     assert.equal(result.plan.status, "blocked");
     assert.equal(result.plan.runs.length, 12);
+    assert.equal(result.plan.protocol.parallelism, 1);
     assert.equal(result.plan.runs.filter((run) => run.status === "not_started").length, 12);
     assert.equal(result.preflight.ok, false);
     const smokeCheck = result.preflight.checks.find((check) => check.name === "restricted_dbt_smoke");
@@ -439,8 +508,87 @@ test("experiment fails closed before model calls and records all 12 runs when pr
     assert.equal(smokeCheck?.passed, false);
     assert.equal(smokeCheck?.command?.includes("debug"), true);
     assert.equal(await fileExists(path.join(experimentRoot, "plan.json")), true);
+    const persistedDefaultPlan = JSON.parse(await readFile(path.join(experimentRoot, "plan.json"), "utf8")) as { protocol: { parallelism: number } };
+    assert.equal(persistedDefaultPlan.protocol.parallelism, 1);
     const reportPath = await writeDiagnosticReport(experimentRoot);
     assert.match(await readFile(reportPath, "utf8"), /12 tasks, one run each = 12 planned runs/);
+
+    const explicitParallel = await runExperiment({
+      ...experimentOptions,
+      experimentRoot: path.join(root, "experiment-parallel-4"),
+      parallelism: 4,
+    });
+    assert.equal(explicitParallel.plan.status, "blocked");
+    assert.equal(explicitParallel.plan.protocol.parallelism, 4);
+    const persistedExplicitPlan = JSON.parse(await readFile(path.join(root, "experiment-parallel-4", "plan.json"), "utf8")) as { protocol: { parallelism: number } };
+    assert.equal(persistedExplicitPlan.protocol.parallelism, 4);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("parallel lifecycle persists batch state before execution", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-parallel-lifecycle-"));
+  try {
+    const fixture = await createExperimentFixture(root);
+    const pythonCommand = await requireLiveDuckDb(t, root);
+    if (!pythonCommand) return;
+    if (!await requireRestrictedBackend(t, root, path.join(root, "restricted-lifecycle-probe"))) return;
+    const { examplesRoot, selected, experimentOptions } = fixture;
+    const validDatabase = path.join(root, "valid.duckdb");
+    const databaseSetup = await runCommand(pythonCommand, ["-I", "-c", "import duckdb, sys; c=duckdb.connect(sys.argv[1]); c.execute('create table main.items (id integer)'); c.close()", validDatabase], { cwd: root, env: safeChildEnv(), timeoutMs: 10_000, maxCapturedChars: 2_000 });
+    assert.equal(databaseSetup.exit_code, 0, databaseSetup.stderr);
+    for (const item of selected) {
+      const project = path.join(examplesRoot, (item.row as { project: string }).project);
+      await copyFile(validDatabase, path.join(project, "data.duckdb"));
+      await writeFile(path.join(project, "sleep-dbt.sh"), "#!/bin/sh\nsleep 2\n", "utf8");
+      await chmod(path.join(project, "sleep-dbt.sh"), 0o755);
+    }
+    const executionRoot = path.join(root, "experiment-execution");
+    const executionPlanPath = path.join(executionRoot, "plan.json");
+    const watchPlan = (async () => {
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        try {
+          const persisted = JSON.parse(await readFile(executionPlanPath, "utf8")) as { status?: string; runs?: Array<{ status?: string }> };
+          const firstBatch = persisted.runs?.slice(0, 4) ?? [];
+          if (persisted.status === "running" && firstBatch.length === 4 && firstBatch.every((run) => run.status === "running")) {
+            for (const item of selected.slice(4, 8)) {
+              await rm(path.join(examplesRoot, (item.row as { project: string }).project), { recursive: true, force: true });
+            }
+            return true;
+          }
+        } catch {
+          // The plan is not written yet or the run is already cleaning up.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return false;
+    })();
+    const originalApiKey = process.env.DEEPSEEK_API_KEY;
+    delete process.env.DEEPSEEK_API_KEY;
+    let executionResult: Awaited<ReturnType<typeof runExperiment>>;
+    let runningObserved: boolean;
+    try {
+      const executionPromise = runExperiment({
+        ...experimentOptions,
+        experimentRoot: executionRoot,
+        pythonCommand,
+        dbtCommand: "./sleep-dbt.sh",
+        parallelism: 4,
+      });
+      runningObserved = await watchPlan;
+      executionResult = await executionPromise;
+    } finally {
+      if (originalApiKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = originalApiKey;
+    }
+    assert.equal(runningObserved, true);
+    assert.equal(executionResult.preflight.ok, true);
+    assert.equal(executionResult.plan.runs.slice(0, 4).every((run) => run.status === "agent_failed"), true);
+    assert.equal(executionResult.plan.runs.slice(4, 8).every((run) => run.status === "environment_failed"), true);
+    assert.equal(executionResult.plan.runs.slice(8).every((run) => run.status === "not_started"), true);
+    const persistedExecutionPlan = JSON.parse(await readFile(executionPlanPath, "utf8")) as { runs: Array<{ status?: string }> };
+    assert.equal(persistedExecutionPlan.runs.slice(8).every((run) => run.status === "not_started"), true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

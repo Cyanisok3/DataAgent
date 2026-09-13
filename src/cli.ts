@@ -55,7 +55,7 @@ function printHelp(): void {
 Commands:
   prepare   --tasks FILE --examples-root DIR --output-dir DIR [--pool-size 12] [--scope-confirmation FILE]
   preflight --selection FILE --experiment-root DIR --evaluator FILE --gold-dir DIR --model ID --thinking LEVEL
-  experiment --selection FILE --examples-root DIR --output-root DIR --model ID --thinking LEVEL --evaluator FILE --gold-dir DIR
+  experiment --selection FILE --examples-root DIR --output-root DIR --model ID --thinking LEVEL --evaluator FILE --gold-dir DIR [--parallel N]
   evaluate  --result-dir DIR --gold-dir DIR --evaluator FILE --selection FILE [--output FILE]
   report    --experiment-root DIR
 `);
@@ -118,6 +118,7 @@ async function main(): Promise<void> {
       pythonCommand: optional(options, "python"),
       dbtCommand: optional(options, "dbt"),
       duckdbCommand: optional(options, "duckdb"),
+      parallelism: numberOption(options, "parallel", 1),
     });
     console.log(JSON.stringify({ status: result.plan.status, experiment_id: result.plan.experiment_id, plan_path: path.join(path.resolve(required(options, "output-root")), "plan.json"), preflight_ok: result.preflight.ok }, null, 2));
     if (result.plan.status !== "completed") process.exitCode = 2;

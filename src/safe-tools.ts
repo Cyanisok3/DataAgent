@@ -31,6 +31,43 @@ async function readTextAt(root: string, input: string): Promise<{ absolutePath: 
 
 const MAX_TOOL_TEXT_CHARS = 32_000;
 const MAX_SEARCH_LINE_CHARS = 1_000;
+const MAX_DBT_TOOL_TEXT_CHARS = 16_000;
+const ANSI_ESCAPE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+const DBT_LOG_TRUNCATION_NOTICE = "[partial dbt log shown; full record is available only for external audit]";
+
+function formatDbtStream(value: string, budget: number): string {
+  if (value.length <= budget) return value;
+  if (budget <= DBT_LOG_TRUNCATION_NOTICE.length) return DBT_LOG_TRUNCATION_NOTICE.slice(0, Math.max(0, budget));
+  const contentBudget = Math.max(0, budget - DBT_LOG_TRUNCATION_NOTICE.length - 1);
+  return `${DBT_LOG_TRUNCATION_NOTICE}${contentBudget > 0 ? `\n${value.slice(-contentBudget)}` : ""}`;
+}
+
+function formatDbtToolOutput(action: string, status: string, stdout: string, stderr: string): string {
+  const prefix = `dbt ${action} ${status}`;
+  const cleanStdout = stdout.replace(ANSI_ESCAPE, "");
+  const cleanStderr = stderr.replace(ANSI_ESCAPE, "");
+  const streams = [cleanStdout, cleanStderr].filter((value) => value.length > 0);
+  if (streams.length === 0) return prefix;
+  const combined = streams.join("\n");
+  if (prefix.length + 1 + combined.length <= MAX_DBT_TOOL_TEXT_CHARS) return `${prefix}\n${combined}`;
+
+  const hasStdout = cleanStdout.length > 0;
+  const hasStderr = cleanStderr.length > 0;
+  const stdoutPrefix = hasStdout ? "\n[stdout]\n" : "";
+  const stderrPrefix = hasStderr ? `${hasStdout ? "\n\n" : "\n"}[stderr]\n` : "";
+  const streamBudget = Math.max(0, MAX_DBT_TOOL_TEXT_CHARS - prefix.length - stdoutPrefix.length - stderrPrefix.length);
+  let stdoutBudget = hasStdout ? Math.min(cleanStdout.length, Math.floor(streamBudget / (hasStderr ? 2 : 1))) : 0;
+  let stderrBudget = hasStderr ? Math.min(cleanStderr.length, streamBudget - stdoutBudget) : 0;
+  let remaining = streamBudget - stdoutBudget - stderrBudget;
+  if (remaining > 0 && hasStdout) {
+    const extra = Math.min(cleanStdout.length - stdoutBudget, remaining);
+    stdoutBudget += extra;
+    remaining -= extra;
+  }
+  if (remaining > 0 && hasStderr) stderrBudget += Math.min(cleanStderr.length - stderrBudget, remaining);
+
+  return `${prefix}${stdoutPrefix}${hasStdout ? formatDbtStream(cleanStdout, stdoutBudget) : ""}${stderrPrefix}${hasStderr ? formatDbtStream(cleanStderr, stderrBudget) : ""}`;
+}
 
 function truncateWithNotice(value: string, maxChars: number, notice: string): string {
   if (value.length <= maxChars) return value;
@@ -303,9 +340,11 @@ export function createSafeTools(options: {
         sandbox_backend: result.sandbox_backend ?? "unavailable",
       };
       await options.onDbtValidation(record);
-      const status = result.timed_out ? "timed out" : `exit_code=${result.exit_code ?? "null"}`;
+      const status = result.timed_out
+        ? result.aborted ? "timed out; cancelled" : "timed out"
+        : result.aborted ? "cancelled" : `exit_code=${result.exit_code ?? "null"}`;
       return {
-        content: [{ type: "text", text: `dbt ${params.action} ${status}\n${truncateText(`${result.stdout}\n${result.stderr}`.trim(), 16_000)}` }],
+        content: [{ type: "text", text: formatDbtToolOutput(params.action, status, result.stdout, result.stderr) }],
         details: { command: result.command, exit_code: result.exit_code, timed_out: result.timed_out, aborted: result.aborted, sandbox_backend: result.sandbox_backend ?? "unavailable", log_path: logPath, duration_ms: Date.now() - startedAt },
       };
     },
