@@ -13,7 +13,7 @@ export const DEFAULT_LIMITS: RunLimits = {
   evaluatorTimeoutMs: 10 * 60 * 1000,
 };
 
-export const DEFAULT_TOOLS = ["read_file", "edit_file", "write_file", "list_files", "search_files", "dbt_build"];
+export const DEFAULT_TOOLS = ["read_file", "edit_file", "write_file", "list_files", "search_files", "dbt_build", "inspect_database"];
 
 export async function loadSystemPrompt(projectRoot: string): Promise<{ path: string; content: string }> {
   const promptPath = path.join(projectRoot, "config", "system-prompt.md");

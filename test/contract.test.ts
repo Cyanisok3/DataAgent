@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -15,12 +15,17 @@ import { runCommand, runRestrictedCommand, safeChildEnv } from "../src/process.j
 import { validationStatus } from "../src/receipt.js";
 import type { FixedAgentConfig, RunReceipt } from "../src/types.js";
 import { createSafeTools } from "../src/safe-tools.js";
+import { runDatabaseInspection } from "../src/database-inspection.js";
 import { createFixedConfig } from "../src/config.js";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 function toolText(result: unknown): string {
   const content = (result as { content?: Array<{ type?: string; text?: string }> }).content ?? [];
   return content.filter((item) => item.type === "text").map((item) => item.text ?? "").join("");
+}
+
+function toolDetails(result: unknown): Record<string, unknown> {
+  return ((result as { details?: Record<string, unknown> }).details ?? {});
 }
 
 function offlineToolConfig(): FixedAgentConfig {
@@ -36,6 +41,66 @@ function offlineToolConfig(): FixedAgentConfig {
     limits: { wallClockMs: 10_000, maxModelRequestAttempts: 30, commandTimeoutMs: 10_000, evaluatorTimeoutMs: 10_000 },
     commands: { python: "python3", dbt: "dbt", duckdb: "duckdb" },
   };
+}
+
+type TestContextLike = { skip: (message?: string) => void };
+
+function testPythonCommand(): string {
+  return process.env.DATAAGENT_TEST_PYTHON?.trim() || offlineToolConfig().commands.python;
+}
+
+function restrictedProbeFailure(result: { exit_code: number | null; timed_out: boolean; aborted: boolean; stderr: string; sandbox_backend?: string }): string {
+  const detail = result.stderr.trim().replace(/\s+/g, " ").slice(0, 240);
+  return `backend=${result.sandbox_backend ?? "unavailable"}; exit_code=${result.exit_code ?? "null"}; timed_out=${result.timed_out}; aborted=${result.aborted}${detail ? `; ${detail}` : ""}`;
+}
+
+async function requireRestrictedBackend(t: TestContextLike, root: string, runtimeDir: string): Promise<boolean> {
+  const result = await runRestrictedCommand("/bin/true", [], {
+    cwd: root,
+    root,
+    runtimeDir,
+    env: safeChildEnv({ TMPDIR: path.join(runtimeDir, "tmp"), HOME: path.join(runtimeDir, "home") }),
+    timeoutMs: 10_000,
+    maxCapturedChars: 2_000,
+  });
+  const usable = (result.sandbox_backend === "macos-sandbox-exec" || result.sandbox_backend === "docker") && result.exit_code === 0 && !result.timed_out && !result.aborted;
+  if (!usable) {
+    t.skip(`UNACCEPTED: restricted backend unavailable or failed: ${restrictedProbeFailure(result)}`);
+    return false;
+  }
+  return true;
+}
+
+async function requireLiveDuckDb(t: TestContextLike, root: string): Promise<string | undefined> {
+  const pythonCommand = testPythonCommand();
+  const hostProbe = await runCommand(pythonCommand, ["-I", "-c", "import duckdb"], { cwd: root, env: safeChildEnv(), timeoutMs: 10_000, maxCapturedChars: 2_000 });
+  if (hostProbe.exit_code !== 0 || hostProbe.timed_out || hostProbe.aborted) {
+    t.skip(`UNACCEPTED: test Python/DuckDB unavailable: ${hostProbe.stderr.trim().replace(/\s+/g, " ").slice(0, 240) || `exit_code=${hostProbe.exit_code ?? "null"}`}`);
+    return undefined;
+  }
+  const restrictedProbe = await runRestrictedCommand(pythonCommand, ["-I", "-c", "import duckdb"], {
+    cwd: root,
+    root,
+    runtimeDir: path.join(root, "restricted-python-probe"),
+    env: safeChildEnv({ PYTHONUNBUFFERED: "1" }),
+    timeoutMs: 10_000,
+    maxCapturedChars: 2_000,
+  });
+  const usable = (restrictedProbe.sandbox_backend === "macos-sandbox-exec" || restrictedProbe.sandbox_backend === "docker") && restrictedProbe.exit_code === 0 && !restrictedProbe.timed_out && !restrictedProbe.aborted;
+  if (!usable) {
+    t.skip(`UNACCEPTED: restricted Python/DuckDB probe failed: ${restrictedProbeFailure(restrictedProbe)}`);
+    return undefined;
+  }
+  return pythonCommand;
+}
+
+function assertSuccessfulRestrictedTool(result: unknown): Record<string, unknown> {
+  const details = toolDetails(result);
+  assert.equal(details.exit_code, 0);
+  assert.equal(details.timed_out, false);
+  assert.equal(details.aborted, false);
+  assert.ok(details.sandbox_backend === "macos-sandbox-exec" || details.sandbox_backend === "docker");
+  return details;
 }
 
 test("fixed seed sampler matches Python random.Random.sample for the protocol seed", () => {
@@ -149,6 +214,134 @@ test("submission artifacts are copied into an official round directory and path 
     const validFormat = await validateRoundResultDirectory({ resultDir, expectedInstanceIds: ["task-01"] });
     assert.equal(validFormat.ok, true);
     await assert.rejects(() => existingPathWithin(repo, path.join(repo, "..", "outside.txt")), /escapes|ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("inspect_database returns stable table and column metadata with pagination", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-database-inspection-"));
+  try {
+    const pythonCommand = await requireLiveDuckDb(t, root);
+    if (!pythonCommand) return;
+    const databasePath = path.join(root, "fixture.duckdb");
+    const setup = [
+      "import sys",
+      "import duckdb",
+      "connection = duckdb.connect(sys.argv[1])",
+      "connection.execute('CREATE SCHEMA analytics')",
+      "connection.execute('CREATE TABLE main.\"weird table\" (\"not null\" INTEGER NOT NULL, \"has space\" VARCHAR)')",
+      "connection.execute('CREATE VIEW analytics.\"Sales View\" AS SELECT 1 AS \"View Column\"')",
+      "for index in range(105): connection.execute(f'CREATE TABLE main.\"table_{index:03d}\" (id INTEGER)')",
+      "connection.close()",
+      "",
+    ].join("\n");
+    const setupResult = await runCommand(pythonCommand, ["-I", "-c", setup, databasePath], { cwd: root, env: safeChildEnv(), timeoutMs: 10_000, maxCapturedChars: 4_000 });
+    assert.equal(setupResult.exit_code, 0, setupResult.stderr);
+    const before = await readFile(databasePath);
+    const inspect = (request: Parameters<typeof runDatabaseInspection>[0]["request"]) => runDatabaseInspection({
+      root,
+      runtimeDir: path.join(root, "runtime"),
+      pythonCommand,
+      commandTimeoutMs: 30_000,
+      remainingMs: () => 30_000,
+      request,
+    });
+
+    const firstPage = await inspect({ path: "fixture.duckdb", action: "tables" });
+    const firstPayload = JSON.parse(firstPage.output) as { rows: Array<Record<string, unknown>>; next_offset: number | null };
+    assert.equal(firstPayload.rows.length, 100);
+    assert.equal(firstPayload.next_offset, 100);
+    assert.equal(firstPage.output.length <= 32_000, true);
+    assert.equal(firstPayload.rows.some((row) => row.table_name === "Sales View" && row.table_type === "VIEW"), true);
+
+    const secondPage = await inspect({ path: "fixture.duckdb", action: "tables", offset: firstPayload.next_offset ?? 0 });
+    const secondPayload = JSON.parse(secondPage.output) as { rows: Array<Record<string, unknown>>; next_offset: number | null };
+    assert.equal(secondPayload.rows.length > 0, true);
+    assert.equal(secondPayload.next_offset, null);
+    assert.equal(new Set(firstPayload.rows.map((row) => row.table_name)).size + new Set(secondPayload.rows.map((row) => row.table_name)).size, 107);
+
+    const schemaPage = JSON.parse((await inspect({ path: "fixture.duckdb", action: "tables", schema: "analytics" })).output) as { rows: Array<Record<string, unknown>>; next_offset: number | null };
+    assert.deepEqual(schemaPage.rows, [{ database_name: "fixture", schema_name: "analytics", table_name: "Sales View", table_type: "VIEW" }]);
+    assert.equal(schemaPage.next_offset, null);
+    const columns = JSON.parse((await inspect({ path: "fixture.duckdb", action: "columns", schema: "main", table: "weird table" })).output) as { rows: Array<Record<string, unknown>>; next_offset: number | null };
+    assert.deepEqual(columns.rows, [
+      { column_name: "not null", data_type: "INTEGER", is_nullable: "NO", ordinal_position: 1 },
+      { column_name: "has space", data_type: "VARCHAR", is_nullable: "YES", ordinal_position: 2 },
+    ]);
+    assert.equal(columns.next_offset, null);
+    assert.deepEqual(await readFile(databasePath), before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("inspect_database rejects unsafe inputs and reports restricted failures", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-database-inspection-errors-"));
+  try {
+    const pythonCommand = await requireLiveDuckDb(t, root);
+    if (!pythonCommand) return;
+    const databasePath = path.join(root, "fixture.duckdb");
+    const setupResult = await runCommand(pythonCommand, ["-I", "-c", "import duckdb, sys; c=duckdb.connect(sys.argv[1]); c.execute('create table main.items (id integer)'); c.close()", databasePath], { cwd: root, env: safeChildEnv(), timeoutMs: 10_000, maxCapturedChars: 2_000 });
+    assert.equal(setupResult.exit_code, 0, setupResult.stderr);
+    await symlink(databasePath, path.join(root, "linked.duckdb"));
+    await writeFile(path.join(root, "broken.duckdb"), "not a DuckDB database\n", "utf8");
+    const inspect = (request: Parameters<typeof runDatabaseInspection>[0]["request"], overrides: Partial<Parameters<typeof runDatabaseInspection>[0]> = {}) => runDatabaseInspection({
+      root,
+      runtimeDir: path.join(root, "runtime"),
+      pythonCommand,
+      commandTimeoutMs: 30_000,
+      remainingMs: () => 30_000,
+      request,
+      ...overrides,
+    });
+    await assert.rejects(() => inspect({ path: databasePath, action: "tables" }), /relative database path/);
+    await assert.rejects(() => inspect({ path: "../fixture.duckdb", action: "tables" }), /escapes its allowed root/);
+    await assert.rejects(() => inspect({ path: "linked.duckdb", action: "tables" }), /symbolic link/);
+    await assert.rejects(() => inspect({ path: "missing.duckdb", action: "tables" }), /does not exist/);
+    await assert.rejects(() => inspect({ path: "fixture.db", action: "tables" }), /only \.duckdb/);
+    await assert.rejects(() => inspect({ path: "fixture.duckdb", action: "columns", schema: "main", table: "missing" }), /Table not found/);
+    await assert.rejects(() => inspect({ path: "fixture.duckdb", action: "columns", schema: "main", table: "items' OR 1=1 --" }), /Table not found/);
+    await assert.rejects(() => inspect({ path: "broken.duckdb", action: "tables" }), /inspect_database failed/);
+    await assert.rejects(() => inspect({ path: "fixture.duckdb", action: "tables", offset: -1 }), /non-negative integer/);
+    await assert.rejects(() => inspect({ path: "fixture.duckdb", action: "tables" }, { remainingMs: () => 0 }), /wall-clock budget/);
+
+    const sleeper = "./sleep-inspection.sh";
+    await writeFile(path.join(root, "sleep-inspection.sh"), "#!/bin/sh\nsleep 2\n", "utf8");
+    await chmod(path.join(root, "sleep-inspection.sh"), 0o755);
+    await assert.rejects(() => inspect({ path: "fixture.duckdb", action: "tables" }, { pythonCommand: sleeper, remainingMs: () => 50 }), /timed out/);
+    const controller = new AbortController();
+    const cancelled = inspect({ path: "fixture.duckdb", action: "tables" }, { pythonCommand: sleeper, remainingMs: () => 2_000, signal: controller.signal });
+    controller.abort();
+    await assert.rejects(() => cancelled, /cancelled/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("dbt debug omits unsupported target arguments and rejects selectors", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-dbt-arguments-"));
+  try {
+    if (!await requireRestrictedBackend(t, root, path.join(root, "restricted-probe"))) return;
+    const config = offlineToolConfig();
+    config.commands.dbt = "/bin/true";
+    const tools = createSafeTools({ root, runtimeDir: path.join(root, "runtime"), config, remainingMs: () => 10_000, onDbtValidation: async () => undefined });
+    const execute = async (name: string, params: Record<string, unknown>) => {
+      const tool = tools.find((candidate) => candidate.name === name);
+      if (!tool) throw new Error(`missing ${name}`);
+      return tool.execute("test", params as never, undefined, undefined, undefined as never);
+    };
+    assert.equal(tools.some((tool) => tool.name === "inspect_database"), true);
+    const debug = assertSuccessfulRestrictedTool(await execute("dbt_build", { action: "debug" }));
+    const debugCommand = (debug.command as string[] | undefined) ?? [];
+    assert.equal(debugCommand.includes("--target-path"), false);
+    assert.equal(debugCommand.includes("--log-path"), true);
+    await assert.rejects(() => execute("dbt_build", { action: "debug", select: "model" }), /select is not supported/);
+    const build = assertSuccessfulRestrictedTool(await execute("dbt_build", { action: "build", select: "model" }));
+    const buildCommand = (build.command as string[] | undefined) ?? [];
+    assert.equal(buildCommand.includes("--target-path"), true);
+    assert.equal(buildCommand.includes("--log-path"), true);
+    assert.equal(buildCommand.includes("--select"), true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -407,7 +600,7 @@ test("text tools skip unreadable files and bound returned output", async () => {
     assert.match(readOutput, /select 1/);
     assert.match(toolText(await execute("read_file", { path: "paged.sql", offset: 2, limit: 1 })), /line 2/);
     assert.match(toolText(await execute("read_file", { path: "paged.sql", offset: 3, limit: 1 })), /line 3/);
-    await assert.rejects(() => execute("read_file", { path: "b-binary.bin" }), /Binary file detected/);
+    await assert.rejects(() => execute("read_file", { path: "b-binary.bin" }), /Binary file detected.*inspect_database/);
 
     const boundedSearch = toolText(await execute("search_files", { path: "zz-many-lines.sql", pattern: "needle", literal: true, limit: 200 }));
     assert.ok(boundedSearch.length <= 32_000);
@@ -646,7 +839,7 @@ test("process timeout terminates descendants and a failed evaluator leaves no in
   }
 });
 
-test("restricted command never falls back to reading a marker outside the task root", async () => {
+test("restricted command never falls back to reading a marker outside the task root", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dataagent-restricted-command-"));
   try {
     const repo = path.join(root, "repo");
@@ -655,6 +848,7 @@ test("restricted command never falls back to reading a marker outside the task r
     await mkdir(repo, { recursive: true });
     await mkdir(runtime, { recursive: true });
     await writeFile(outside, "outside-marker\n", "utf8");
+    if (!await requireRestrictedBackend(t, repo, runtime)) return;
     const result = await runRestrictedCommand("/bin/cat", [outside], {
       cwd: repo,
       root: repo,
@@ -664,6 +858,10 @@ test("restricted command never falls back to reading a marker outside the task r
     });
     assert.equal(result.stdout.includes("outside-marker"), false);
     assert.notEqual(result.exit_code, 0);
+    if (result.sandbox_backend === "macos-sandbox-exec") {
+      const profile = await readFile(path.join(runtime, "sandbox.sb"), "utf8");
+      assert.equal(profile.includes('(subpath "/")'), false);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -189,14 +189,19 @@ export function detectRestrictedBackend(): SandboxBackend {
   return "unavailable";
 }
 
-async function resolveCommandPath(command: string, env: NodeJS.ProcessEnv): Promise<string | undefined> {
+interface ResolvedCommandPath {
+  lexicalPath: string;
+  canonicalPath: string;
+}
+
+async function resolveCommandPath(command: string, env: NodeJS.ProcessEnv): Promise<ResolvedCommandPath | undefined> {
   const candidates = path.isAbsolute(command)
     ? [command]
     : (env.PATH ?? process.env.PATH ?? "").split(path.delimiter).filter(Boolean).map((directory) => path.join(directory, command));
   for (const candidate of candidates) {
     try {
       await access(candidate, constants.X_OK);
-      return await realpath(candidate);
+      return { lexicalPath: path.resolve(candidate), canonicalPath: await realpath(candidate) };
     } catch {
       // Try the next PATH entry.
     }
@@ -204,15 +209,17 @@ async function resolveCommandPath(command: string, env: NodeJS.ProcessEnv): Prom
   return undefined;
 }
 
-async function resolveShebang(commandPath: string, env: NodeJS.ProcessEnv): Promise<string | undefined> {
+async function resolveShebang(commandPath: ResolvedCommandPath, env: NodeJS.ProcessEnv): Promise<ResolvedCommandPath | undefined> {
   try {
-    const firstLine = (await readFile(commandPath, "utf8")).slice(0, 256).split(/\r?\n/, 1)[0];
+    const firstLine = (await readFile(commandPath.lexicalPath, "utf8")).slice(0, 256).split(/\r?\n/, 1)[0];
     if (!firstLine.startsWith("#!")) return undefined;
     const parts = firstLine.slice(2).trim().split(/\s+/);
     const interpreter = parts[0];
     if (!interpreter) return undefined;
     if (path.basename(interpreter) === "env" && parts[1]) return resolveCommandPath(parts[1], env);
-    return path.isAbsolute(interpreter) ? (await realpath(interpreter).catch(() => interpreter)) : resolveCommandPath(interpreter, env);
+    if (!path.isAbsolute(interpreter)) return resolveCommandPath(interpreter, env);
+    const lexicalPath = path.resolve(interpreter);
+    return { lexicalPath, canonicalPath: await realpath(lexicalPath) };
   } catch {
     return undefined;
   }
@@ -222,13 +229,18 @@ function addPath(set: Set<string>, value: string | undefined): void {
   if (value) set.add(value);
 }
 
-function addCommandDependencyRoots(readRoots: Set<string>, commandPath: string | undefined, interpreterPath: string | undefined): void {
-  for (const executable of [commandPath, interpreterPath]) {
-    if (!executable) continue;
-    const parent = path.dirname(executable);
-    // A virtualenv/SDK is conventionally <prefix>/bin/<executable>. Allow
-    // only that prefix, never its broad user-home ancestor.
-    if (path.basename(parent) === "bin") addPath(readRoots, path.dirname(parent));
+function addCommandDependencyRoots(readRoots: Set<string>, ...commands: Array<ResolvedCommandPath | undefined>): void {
+  for (const command of commands) {
+    if (!command) continue;
+    for (const executable of [command.lexicalPath, command.canonicalPath]) {
+      const parent = path.dirname(executable);
+      if (path.basename(parent) !== "bin") continue;
+      const prefix = path.dirname(parent);
+      if (path.parse(prefix).root === prefix) continue;
+      // A command under <prefix>/bin may need its restricted runtime prefix,
+      // but never infer the filesystem root or a broader parent directory.
+      addPath(readRoots, prefix);
+    }
   }
 }
 
@@ -261,14 +273,18 @@ async function macSandboxProfile(options: { root: string; runtimeDir: string; co
     root,
     runtimeDir,
   ]);
-  addPath(readRoots, options.env.VIRTUAL_ENV);
   addCommandDependencyRoots(readRoots, commandPath, interpreterPath);
   const existingReadRoots: string[] = [];
   for (const candidate of readRoots) {
     const canonical = await existingCanonicalPath(candidate);
     if (canonical && !existingReadRoots.includes(canonical)) existingReadRoots.push(canonical);
   }
-  const executableLiterals = [commandPath, interpreterPath].filter((value): value is string => Boolean(value));
+  const executableLiterals = [
+    commandPath?.lexicalPath,
+    commandPath?.canonicalPath,
+    interpreterPath?.lexicalPath,
+    interpreterPath?.canonicalPath,
+  ].filter((value): value is string => Boolean(value));
   const readRules = existingReadRoots.map((value) => `  (subpath "${seatbeltQuote(value)}")`).join("\n");
   const executableRules = executableLiterals.map((value) => `  (literal "${seatbeltQuote(value)}")`).join("\n");
   const profile = [

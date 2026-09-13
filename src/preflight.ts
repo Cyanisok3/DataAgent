@@ -4,6 +4,7 @@ import { createFixedConfig, loadSystemPrompt, PI_SDK_VERSION } from "./config.js
 import { copyTree, ensureDir, fileExists, isWithin, readJson, toPosix, writeJson } from "./files.js";
 import { commandVersion, detectRestrictedBackend, runCommand, runRestrictedCommand, safeChildEnv } from "./process.js";
 import { loadSelection } from "./selection.js";
+import { runDatabaseInspection } from "./database-inspection.js";
 import { validateRoundResultDirectory } from "./submission.js";
 import type { FixedAgentConfig, SelectionManifest } from "./types.js";
 
@@ -309,6 +310,36 @@ export async function runPreflight(options: {
       passed: smokeResult.exit_code === 0 && !smokeResult.timed_out && !smokeResult.aborted,
       details: `backend=${restrictedBackend}; ${compactCommandOutput(smokeResult.stdout, smokeResult.stderr)}`,
       command: smokeResult.command,
+    });
+  }
+
+  const inspectionPython = config?.commands.python ?? options.pythonCommand ?? "python3";
+  const smokeSelected = manifest?.selected[0];
+  const inspectionDatabase = smokeSelected?.databaseFiles.find((file) => file.toLowerCase().endsWith(".duckdb"));
+  try {
+    if (!inspectionDatabase) throw new Error("no selected .duckdb file is available for the database inspection smoke test");
+    const inspection = await runDatabaseInspection({
+      root: smokeRepo,
+      runtimeDir: path.join(smokeRuntime, "database-inspection"),
+      pythonCommand: inspectionPython,
+      commandTimeoutMs: Math.min(config?.limits.commandTimeoutMs ?? 30_000, 30_000),
+      remainingMs: () => 30_000,
+      request: { path: inspectionDatabase, action: "tables" },
+    });
+    add(checks, {
+      name: "restricted_database_inspection",
+      required: true,
+      passed: true,
+      details: `backend=${inspection.sandboxBackend}; rows=${inspection.rowCount}; next_offset=${inspection.nextOffset ?? "none"}`,
+      command: inspection.command,
+    });
+  } catch (error) {
+    add(checks, {
+      name: "restricted_database_inspection",
+      required: true,
+      passed: false,
+      details: error instanceof Error ? error.message : String(error),
+      command: [inspectionPython, "-I", "-c", "<fixed database inspection>", inspectionDatabase ?? ""],
     });
   }
 

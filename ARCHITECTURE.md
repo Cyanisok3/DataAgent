@@ -11,6 +11,8 @@ TypeScript + Pi Coding Agent SDK（0.85.1）读取和修改 dbt 工程，通过�
 
 代码均位于 `src/`。单任务顺序为：新工作区 → Agent 读改文件与 dbt 验证 → runner 最终构建 → 提交产物；整轮结束后统一评分。
 
+当前工具为 `read_file`、`edit_file`、`write_file`、`list_files`、`search_files`、`dbt_build` 和只读的 `inspect_database`。后者只接受工作区内相对 `.duckdb` 文件，固定查询表、视图及列元数据，不接受用户 SQL。
+
 文件工具仅访问任务 repo；dbt 在 Docker 或 macOS 沙箱中执行，无可用后端则停止。Agent 不启用任意 shell，gold、evaluator 和评分结果不进入其工具可读范围或修复循环。API key 从环境变量注入 SDK 内存。
 
-`dbt build/test` 通过与官方成功分别记录。运行约定见 [EXPERIMENT.md](EXPERIMENT.md)，四项修复与验收见 [review.md](review.md)。
+`dbt build/test` 通过与官方成功分别记录。实验状态见 [EXPERIMENT.md](EXPERIMENT.md)。表结构探查已按 [REVIEW.md](REVIEW.md) 接入，并仅通过受限子进程执行只读 DuckDB 查询。

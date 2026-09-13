@@ -2,6 +2,7 @@ import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createDatabaseInspectionTool } from "./database-inspection.js";
 import { assertWithin, ensureDir, existingPathWithin, fileExists, toPosix, truncateText, walkFiles, writablePathWithin } from "./files.js";
 import { runRestrictedCommand, safeChildEnv } from "./process.js";
 import type { DbtValidationRecord, FixedAgentConfig } from "./types.js";
@@ -23,7 +24,7 @@ async function readTextAt(root: string, input: string): Promise<{ absolutePath: 
   }
   const buffer = await readFile(absolutePath);
   if (buffer.subarray(0, 8192).includes(0)) {
-    throw new Error(`Binary file detected (${input}); use dbt_build to inspect database contents instead of read_file.`);
+    throw new Error(`Binary file detected (${input}); use inspect_database for .duckdb tables and columns instead of read_file.`);
   }
   return { absolutePath, content: buffer.toString("utf8") };
 }
@@ -270,7 +271,10 @@ export function createSafeTools(options: {
         ensureDir(path.join(runtimeDir, "cache")),
         ensureDir(path.join(runtimeDir, "pycache")),
       ]);
-      const commandArgs = ["--no-version-check", params.action, "--profiles-dir", profilesDir, "--target-path", targetDir, "--log-path", logDir];
+      if (params.action === "debug" && params.select) throw new Error("select is not supported for dbt debug");
+      const commandArgs = ["--no-version-check", params.action, "--profiles-dir", profilesDir];
+      if (params.action !== "debug") commandArgs.push("--target-path", targetDir);
+      commandArgs.push("--log-path", logDir);
       if (params.select) commandArgs.push("--select", params.select);
       const startedAt = Date.now();
       const result = await runRestrictedCommand(options.config.commands.dbt, commandArgs, {
@@ -302,10 +306,17 @@ export function createSafeTools(options: {
       const status = result.timed_out ? "timed out" : `exit_code=${result.exit_code ?? "null"}`;
       return {
         content: [{ type: "text", text: `dbt ${params.action} ${status}\n${truncateText(`${result.stdout}\n${result.stderr}`.trim(), 16_000)}` }],
-        details: { command: result.command, exit_code: result.exit_code, timed_out: result.timed_out, sandbox_backend: result.sandbox_backend ?? "unavailable", log_path: logPath, duration_ms: Date.now() - startedAt },
+        details: { command: result.command, exit_code: result.exit_code, timed_out: result.timed_out, aborted: result.aborted, sandbox_backend: result.sandbox_backend ?? "unavailable", log_path: logPath, duration_ms: Date.now() - startedAt },
       };
     },
   });
 
-  return [readFileTool, editFileTool, writeFileTool, listFilesTool, searchFilesTool, dbtBuildTool];
+  const databaseInspectionTool = createDatabaseInspectionTool({
+    root,
+    runtimeDir: options.runtimeDir,
+    pythonCommand: options.config.commands.python,
+    commandTimeoutMs: options.config.limits.commandTimeoutMs,
+    remainingMs: options.remainingMs,
+  });
+  return [readFileTool, editFileTool, writeFileTool, listFilesTool, searchFilesTool, dbtBuildTool, databaseInspectionTool];
 }

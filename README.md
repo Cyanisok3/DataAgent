@@ -1,6 +1,6 @@
 # Data Engineering Agent
 
-当前结构与实验约定见 `ARCHITECTURE.md` 和 `EXPERIMENT.md`。实现只依赖 `DataAgent/` 自身；同级项目不是运行依赖。
+当前结构见 [ARCHITECTURE.md](ARCHITECTURE.md)，实验状态见 [EXPERIMENT.md](EXPERIMENT.md)。已补齐受限的 `inspect_database` 表结构探查并完成离线验收；本轮不启动新一轮模型评测。实现只依赖 `DataAgent/` 自身；同级项目仅作参考。
 
 ## 闭环
 
@@ -18,7 +18,7 @@ npm run build
 npm test
 ```
 
-Pi SDK 要求 Node `>=22.19.0`。本项目不把模型 ID、API key、benchmark 数据或 gold 写入代码；正式运行时必须显式提供准确模型 ID 和路径。
+Pi SDK 要求 Node `>=22.19.0`。模型 ID 与 thinking 按固定协议校验；API key 通过环境变量注入，benchmark 数据与 gold 从外部路径读取。
 
 ## 典型用法
 
@@ -57,4 +57,4 @@ npm run dev -- report --experiment-root /path/to/experiment
 
 确认文件每行只允许 `instance_id`、`related_models`（项目内相对模型路径）以及带 `score` 和必要结构指标的三项观察字段；不允许答案、gold 或其他字段。生成的 `selection.json` 会连同确认文件副本，并在后续加载时重新校验。
 
-`experiment` 默认 fail-closed：只启用受路径约束的读写/搜索工具；Agent 的 `dbt_build` 和 runner 最终验证都必须进入受限子进程后端（macOS `sandbox-exec`，或显式配置的 Docker），没有可用且可运行的后端就不会调用模型。Pi 的任意 `bash` 工具保持关闭，因此任务工具不能下载答案或访问 workspace 外部路径。自动 SDK 压缩关闭，模型请求数按实际 assistant 响应计数。官方 evaluator 只在 Agent 结束后由父进程调用。
+`experiment` 默认 fail-closed：只启用受路径约束的读写/搜索工具；Agent 的 `dbt_build` 和 runner 最终验证都必须进入受限子进程后端（macOS `sandbox-exec`，或显式配置的 Docker），没有可用且可运行的后端就不会调用模型。Pi 的任意 `bash` 工具保持关闭，因此任务工具不能下载答案或访问 workspace 外部路径。自动 SDK 压缩关闭，模型请求数按实际请求分派计数。官方 evaluator 只在 Agent 结束后由父进程调用。
