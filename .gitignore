@@ -1,0 +1,33 @@
+# Secrets
+api_key.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# Databases
+*.db
+sessions.db
+business.db
+
+# Next.js
+chat-frontend/node_modules/
+chat-frontend/.next/
+chat-frontend/out/
+chat-frontend/build/
+chat-frontend/.env*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
