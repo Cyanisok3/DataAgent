@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useRef } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Trace = { type: "thinking" | "tool_call" | "tool_result", content: string };
 type Turn = { id: number, user: string, traces: Trace[], answer: string };
@@ -108,11 +110,36 @@ export default function ChatPage() {
                             </div>
                         ))}
 
-                        {/* 本轮回答 */}
+                        {/* 本轮回答：markdown 渲染（表格/列表/加粗） */}
                         {t.answer && (
                             <div>
-                                <div className="inline-block p-2 rounded max-w-[80%] bg-gray-100 text-gray-900">
-                                    {t.answer}
+                                <div className="inline-block p-3 rounded max-w-[80%] bg-gray-100 text-gray-900">
+                                    <ReactMarkdown
+                                        remarkPlugins={[remarkGfm]}
+                                        components={{
+                                            table: (props) => (
+                                                <table className="border-collapse my-1 text-sm" {...props} />
+                                            ),
+                                            th: (props) => (
+                                                <th className="border px-2 py-1 bg-gray-200 font-semibold" {...props} />
+                                            ),
+                                            td: (props) => (
+                                                <td className="border px-2 py-1" {...props} />
+                                            ),
+                                            p: (props) => <p className="my-1" {...props} />,
+                                            ul: (props) => <ul className="list-disc pl-5 my-1" {...props} />,
+                                            ol: (props) => <ol className="list-decimal pl-5 my-1" {...props} />,
+                                            strong: (props) => <strong className="font-semibold" {...props} />,
+                                            code: (props) => (
+                                                <code className="bg-gray-200 px-1 rounded text-sm" {...props} />
+                                            ),
+                                            pre: (props) => (
+                                                <pre className="bg-gray-800 text-white p-2 rounded overflow-x-auto text-sm my-1" {...props} />
+                                            ),
+                                        }}
+                                    >
+                                        {t.answer}
+                                    </ReactMarkdown>
                                 </div>
                             </div>
                         )}

@@ -1,2 +1,12 @@
+# Python 版 DataAgent 后端依赖（L7 起逐步引入）
+# 安装：pip install -r requirements.txt
+
+# Web 框架（main.py）
 fastapi>=0.110.0
 uvicorn>=0.29.0
+
+# LLM 客户端（llm.py）——DeepSeek 走 OpenAI 兼容协议
+openai>=1.0.0
+
+# SQL 解析与方言改写（sql_guard.py）
+sqlglot>=20.0.0

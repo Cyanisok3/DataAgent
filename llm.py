@@ -17,6 +17,8 @@ llm.py —— 接 DeepSeek（兼容 OpenAI API）
   两者语义不同，但共享"组装 + 调用"，所以抽公共层，而不是合并成一个。
 """
 import json
+import sqlite3
+from datetime import date, timedelta
 from openai import OpenAI
 
 # 读 API key（从文件读，不硬编码）
@@ -31,13 +33,22 @@ client = OpenAI(
 
 MODEL = "deepseek-flash"
 
-# System prompt：告诉模型工具列表和输出格式
-SYSTEM_PROMPT = """你是一个数据查询助手。你可以调用以下工具：
+# System prompt 模板：日期信息每次调用实时注入（对齐原版 AgentService.systemPrompt() 设计）
+# 注意 f-string 里 JSON 的大括号要写成 {{ }} 转义
+_SYSTEM_PROMPT_TEMPLATE = """你是一个数据查询助手。你可以调用以下工具：
 
 1. get_context(question: str) —— 根据用户问题，匹配相关的数据域、表和指标元数据
 2. execute_sql(sql: str) —— 执行 SELECT SQL 查询数据库
 
+当前日期信息（时区 Asia/Shanghai）：
+- 今天是 {today}
+- 昨天是 {yesterday}
+- 明天是 {tomorrow}
+- 数据库中的订单数据最新到 {data_end}
+
 规则：
+- 用户提到"今天/昨天/最近 N 天/上周/本月"等相对日期时，先按上面的当前日期换算成具体日期，
+  再写 SQL（可以直接用 CURRENT_DATE 计算）
 - 收到用户问题后，先调 get_context 了解可用的表和指标
 - 根据 get_context 返回的元数据，写正确的 SQL，再调 execute_sql
 - 拿到 SQL 结果后，直接总结回答，不要再调工具
@@ -46,9 +57,32 @@ SYSTEM_PROMPT = """你是一个数据查询助手。你可以调用以下工具�
   仍失败就用已有的信息直接回答用户，不要重复生成同样的 SQL
 
 你必须严格按以下 JSON 格式回复（不要加任何其他文字、不要用 markdown 代码块）：
-- 想调工具时：{"thought": "你的思考", "tool": "工具名", "args": {"参数名": "参数值"}}
-- 想直接回答时：{"thought": "你的思考", "final": "最终回答"}
+- 想调工具时：{{"thought": "你的思考", "tool": "工具名", "args": {{"参数名": "参数值"}}}}
+- 想直接回答时：{{"thought": "你的思考", "final": "最终回答"}}
 """
+
+
+def _latest_order_time() -> str:
+    """从 business.db 查订单数据最新时间——让模型知道数据覆盖范围，
+    就不会把历史静态数据误判成"没有最近数据"。"""
+    try:
+        conn = sqlite3.connect("business.db")
+        row = conn.execute("SELECT MAX(ordered_at) FROM orders").fetchone()
+        conn.close()
+        return row[0] if row and row[0] else "未知"
+    except Exception:
+        return "未知"
+
+
+def _build_system_prompt() -> str:
+    """实时注入当前日期（对齐原版：每次构建 agent 时 LocalDate.now(Asia/Shanghai)）"""
+    today = date.today()
+    return _SYSTEM_PROMPT_TEMPLATE.format(
+        today=today,
+        yesterday=today - timedelta(days=1),
+        tomorrow=today + timedelta(days=1),
+        data_end=_latest_order_time(),
+    )
 
 # 最终回答阶段的 system prompt：纯总结，不要 JSON、不要思考过程
 FINAL_SYSTEM_PROMPT = (
@@ -125,7 +159,7 @@ def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
     # derive：投影骨架里的 user/assistant 多轮直传（合法角色）；
     # 工具结果不能以 role=tool 直传（OpenAI 协议要求 tool_call_id 配对），
     # 翻译成文本拼进当前 user_content——JSON 协议下的标准做法。
-    api_messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    api_messages: list[dict] = [{"role": "system", "content": _build_system_prompt()}]
     if history:
         api_messages.extend(
             m for m in history if m["role"] in ("user", "assistant")

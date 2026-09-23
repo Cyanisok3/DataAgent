@@ -32,6 +32,9 @@ class Table:
     columns: list[str]     # 列名
     is_visible: bool       # 是否对用户可见（门禁 1）
     keywords: list[str]    # 匹配关键词（独立维护，不靠描述分词）
+    column_descriptions: dict[str, str] = field(default_factory=dict)
+    #   列级注释（对应原版 column_info 层）：列名 → 业务含义
+    #   模型靠它区分"订单时间 vs 开业时间"，避免时间字段误用
 
 
 @dataclass
@@ -69,6 +72,15 @@ TABLES = [
                  "subtotal", "tax_paid", "order_total"],
         is_visible=True,
         keywords=["订单", "销售额", "销售", "金额", "收入", "营收", "客单价", "交易"],
+        column_descriptions={
+            "id": "订单唯一标识（UUID）",
+            "customer_id": "下单客户 ID（关联 customers.id）",
+            "ordered_at": "下单时间。所有时间类查询（最近 N 天/按月）都用这个字段",
+            "store_id": "下单门店 ID（关联 stores.id）",
+            "subtotal": "商品小计金额（美元）",
+            "tax_paid": "税费金额（美元）",
+            "order_total": "订单总金额（美元，含税）。销售额口径 = SUM(order_total)",
+        },
     ),
     Table(
         name="items",
@@ -77,6 +89,11 @@ TABLES = [
         columns=["id", "order_id", "sku"],
         is_visible=True,
         keywords=["明细", "买了", "sku", "SKU", "商品", "销量", "卖"],
+        column_descriptions={
+            "id": "明细行唯一标识（UUID）",
+            "order_id": "所属订单 ID（关联 orders.id）",
+            "sku": "商品 SKU（关联 products.sku）",
+        },
     ),
     Table(
         name="customers",
@@ -85,6 +102,10 @@ TABLES = [
         columns=["id", "name"],
         is_visible=True,
         keywords=["客户", "用户", "买家", "顾客"],
+        column_descriptions={
+            "id": "客户 ID（UUID）",
+            "name": "客户姓名",
+        },
     ),
     Table(
         name="products",
@@ -93,6 +114,13 @@ TABLES = [
         columns=["sku", "name", "type", "price", "description"],
         is_visible=True,
         keywords=["商品", "品类", "价格", "多少钱", "产品", "sku", "SKU"],
+        column_descriptions={
+            "sku": "商品 SKU（唯一编码）",
+            "name": "商品名称",
+            "type": "商品品类（beverage=饮品 / food=食品 / jaffle=华夫饼 / merch=周边）",
+            "price": "商品单价（美元）",
+            "description": "商品描述",
+        },
     ),
     Table(
         name="stores",
@@ -101,6 +129,12 @@ TABLES = [
         columns=["id", "name", "opened_at", "tax_rate"],
         is_visible=True,
         keywords=["门店", "店铺", "店"],
+        column_descriptions={
+            "id": "门店 ID（UUID）",
+            "name": "门店名（如 Philadelphia）",
+            "opened_at": "门店开业时间（历史日期，静态属性，不是订单时间）。销售类查询请用 orders.ordered_at",
+            "tax_rate": "门店税率",
+        },
     ),
     Table(
         name="supplies",
@@ -109,6 +143,13 @@ TABLES = [
         columns=["id", "name", "cost", "perishable", "sku"],
         is_visible=False,  # 门禁 1：供应品对用户隐藏（内部数据）
         keywords=["供应", "食材", "成本"],
+        column_descriptions={
+            "id": "供应品标识（原数据有重复，仅展示用）",
+            "name": "供应品名称",
+            "cost": "成本（美元）",
+            "perishable": "是否易腐（0/1）",
+            "sku": "关联商品 SKU",
+        },
     ),
 ]
 
@@ -236,7 +277,13 @@ def build_context(question: str) -> dict:
     tables = match_tables(question, domains, metrics)  # 后表：关键词 + 指标依赖
     return {
         "domains": [{"key": d.key, "name": d.name, "description": d.description} for d in domains],
-        "tables": [{"name": t.name, "description": t.description, "columns": t.columns} for t in tables],
+        "tables": [{
+            "name": t.name,
+            "description": t.description,
+            # 列级注释（column_info 层）：模型区分业务时间字段 vs 静态属性字段
+            "columns": [{"name": c, "description": t.column_descriptions.get(c, "")}
+                        for c in t.columns],
+        } for t in tables],
         "metrics": [{"key": m.key, "name": m.name, "sql_expression": m.sql_expression,
                      "table": m.table, "time_field": m.time_field, "filters": m.filters}
                     for m in metrics],

@@ -8,7 +8,7 @@ from llm import chat
 from llm import chat_stream_final
 from tools import TOOLS
 
-MAX_ITERS = 5
+MAX_ITERS = 10
 
 
 def run_react(user_message: str, history: list[dict] | None = None) -> dict:
