@@ -14,7 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from react_loop import run_react, run_react_stream
-from session_store import init_db, save_message, load_messages
+from session_store import (
+    init_db, save_message, load_messages, project_history,
+    KIND_CONTEXT, KIND_RESULT,
+)
 from db import init_db as init_business_db
 
 app = FastAPI(title="Data Agent Demo", version="0.4")
@@ -47,13 +50,14 @@ def root():
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    # 1. 加载历史消息
-    history = load_messages(req.session_id)
-    # 2. 把当前用户消息加进去
-    history.append({"role": "user", "content": req.message})
-    # 3. 跑 ReAct
-    result = run_react(req.message)  # 简化版：先不把历史传给 LLM
-    # 4. 存到数据库
+    # 空消息校验：不落库、不调 LLM（省一次 API 调用）
+    if not req.message.strip():
+        return {"answer": "请先输入想问的问题。", "trace": []}
+    # 1. 加载全量日志 + 投影出"该给模型看什么"（多轮上下文骨架）
+    projected = project_history(load_messages(req.session_id))
+    # 2. 跑 ReAct（历史骨架传给 LLM，模型记得之前聊过什么）
+    result = run_react(req.message, projected)
+    # 3. 本次对话追加进日志（只追加，永不删）
     save_message(req.session_id, "user", req.message)
     save_message(req.session_id, "assistant", result["answer"])
     return result
@@ -63,15 +67,32 @@ def chat(req: ChatRequest):
 def chat_stream(req: ChatRequest):
     """SSE 流式：逐步推送事件"""
     def event_generator():
-        # 存用户消息
+        # 空消息校验：直接返回友好提示，不调 LLM
+        if not req.message.strip():
+            yield ("data: " + json.dumps(
+                {"type": "text", "content": "请先输入想问的问题。"},
+                ensure_ascii=False) + "\n\n")
+            return
+        # 投影：旧历史给模型看；新用户消息稍后再追加进日志
+        projected = project_history(load_messages(req.session_id))
+        # 存用户消息（写入日志）
         save_message(req.session_id, "user", req.message)
 
         # 收集 assistant 的最终回答
         final_answer = ""
 
-        for event in run_react_stream(req.message):
+        for event in run_react_stream(req.message, projected):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            if event["type"] == "text":
+            if event["type"] == "text_chunk":
+                final_answer += event["content"]   # 逐字拼接
+            elif event["type"] == "tool_result":
+                # 工具结果落库，并声明 kind（判断前置到写入时）：
+                #   get_context 元数据 = 引导性（context），消费完即弃
+                #   execute_sql 结果 = 事实性（result），可被追问引用
+                kind = KIND_CONTEXT if event["name"] == "get_context" \
+                    else KIND_RESULT
+                save_message(req.session_id, "tool", event["output"], kind)
+            elif event["type"] == "text":          # max_iters 兜底分支
                 final_answer = event["content"]
 
         # 存 assistant 回复

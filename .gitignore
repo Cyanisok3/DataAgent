@@ -14,6 +14,7 @@ venv/
 *.db
 sessions.db
 business.db
+data/*
 
 # Next.js
 chat-frontend/node_modules/

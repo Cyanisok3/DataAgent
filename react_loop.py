@@ -5,18 +5,30 @@ react_loop.py —— ReAct 循环（流式版）
 而是每一步 yield 一个事件——前端实时看到"想了什么、调了什么工具"。
 """
 from llm import chat
+from llm import chat_stream_final
 from tools import TOOLS
 
 MAX_ITERS = 5
 
 
-def run_react(user_message: str) -> dict:
-    """非流式版：攒完所有步骤再一次性返回（保留给 /chat 用）"""
+def run_react(user_message: str, history: list[dict] | None = None) -> dict:
+    """非流式版：攒完所有步骤再一次性返回（保留给 /chat 用）
+    history：投影后的历史骨架（多轮上下文），传给 LLM"""
     messages = [{"role": "user", "content": user_message}]
     trace = []
 
     for i in range(MAX_ITERS):
-        result = chat(messages)
+        # 决策：拿结构化 JSON。解析失败（重试后仍失败）→ 降级为友好提示，
+        # 绝不把异常抛给用户（前端看到 500 是灾难，用户测试尤其如此）。
+        try:
+            result = chat(messages, history)
+        except Exception as e:
+            trace.append({"type": "thinking",
+                          "content": f"模型输出解析失败（{type(e).__name__}），已中止本轮"})
+            return {
+                "answer": "抱歉，模型回复格式异常，请换个问法再试一次。",
+                "trace": trace,
+            }
         trace.append({"type": "thinking", "content": result["thought"]})
 
         if "final" in result:
@@ -27,8 +39,12 @@ def run_react(user_message: str) -> dict:
         tool_args = result["args"]
         trace.append({"type": "tool_call", "name": tool_name, "input": tool_args})
 
-        tool_fn = TOOLS[tool_name]["fn"]
-        tool_output = tool_fn(**tool_args)
+        # 工具调用兜底：任何异常都转成可读结果，绝不让前端看到 500
+        try:
+            tool_fn = TOOLS[tool_name]["fn"]
+            tool_output = tool_fn(**tool_args)
+        except Exception as e:
+            tool_output = f"❌ 工具 {tool_name} 执行异常: {type(e).__name__}: {e}"
 
         trace.append({"type": "tool_result", "name": tool_name, "output": tool_output})
 
@@ -41,30 +57,47 @@ def run_react(user_message: str) -> dict:
     }
 
 
-def run_react_stream(user_message: str):
+def run_react_stream(user_message: str, history: list[dict] | None = None):
     """
-    流式版：每一步 yield 一个事件（generator）
-    对应 L5 学的 ChatStreamEvent——前端实时看到过程
+    流式版：思考/工具调用是步骤级流式，最终回答是逐字流式
+    history：投影后的历史骨架（多轮上下文），传给 LLM
     """
     messages = [{"role": "user", "content": user_message}]
 
     for i in range(MAX_ITERS):
-        # 1. 想
-        result = chat(messages)
+        # 1. 想（一次性 JSON，因为要解析 tool/args）
+        try:
+            result = chat(messages, history)
+        except Exception as e:
+            yield {"type": "thinking",
+                   "content": f"模型输出解析失败（{type(e).__name__}），已中止本轮"}
+            yield {"type": "text",
+                   "content": "抱歉，模型回复格式异常，请换个问法再试一次。"}
+            return
         yield {"type": "thinking", "content": result["thought"]}
 
-        # 2. 有最终答案就返回
+        # 2. 如果模型说要最终回答
         if "final" in result:
-            yield {"type": "text", "content": result["final"]}
+            # 拿到工具结果（最后一条 tool 消息）
+            tool_output = next(
+                (m["content"] for m in reversed(messages) if m["role"] == "tool"),
+                None
+            )
+            # 逐字流式生成回答（带上历史骨架，追问时知道上文）
+            for chunk in chat_stream_final(user_message, tool_output, history):
+                yield {"type": "text_chunk", "content": chunk}
             return
 
-        # 3. 做：调工具
+        # 3. 做：调工具（异常兜底，转成可读结果，不中断流）
         tool_name = result["tool"]
         tool_args = result["args"]
         yield {"type": "tool_call", "name": tool_name, "input": tool_args}
 
-        tool_fn = TOOLS[tool_name]["fn"]
-        tool_output = tool_fn(**tool_args)
+        try:
+            tool_fn = TOOLS[tool_name]["fn"]
+            tool_output = tool_fn(**tool_args)
+        except Exception as e:
+            tool_output = f"❌ 工具 {tool_name} 执行异常: {type(e).__name__}: {e}"
 
         yield {"type": "tool_result", "name": tool_name, "output": tool_output}
 
@@ -73,6 +106,7 @@ def run_react_stream(user_message: str):
         messages.append({"role": "tool", "content": tool_output})
 
     yield {"type": "text", "content": f"已达最大思考轮数（{MAX_ITERS}）"}
+
 
 
 # 自测

@@ -30,7 +30,27 @@ def execute_sql(sql: str) -> str:
         return f"❌ SQL 被安全护栏拒绝: {e}"
 
     # 第 2 步：真查 SQLite 数据库
-    return execute_query(safe_sql)
+    try:
+        return execute_query(safe_sql)
+    except Exception as e:
+        # 执行期错误兜底：列名/表名写错是模型高频错误，
+        # 把"可用列"也返回给它，它才能自我修正（否则会原地循环）
+        hint = _column_hint(sql)
+        return f"❌ SQL 执行失败: {type(e).__name__}: {e}\n{hint}"
+
+
+def _column_hint(sql: str) -> str:
+    """从 SQL 里猜出涉及的表，返回该表的可用列名（给模型修正参考）"""
+    import re
+    from semantic_layer import TABLES
+    m = re.search(r"from\s+(\w+)", sql, re.IGNORECASE)
+    if not m:
+        return ""
+    table_name = m.group(1).lower()
+    for t in TABLES:
+        if t.name == table_name:
+            return f"提示：{table_name} 表的可用列是 {t.columns}，请使用这些列名重写 SQL"
+    return ""
 
 
 # 工具表：名字 → {函数, 描述}
