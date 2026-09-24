@@ -1,17 +1,46 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 type Trace = { type: "thinking" | "tool_call" | "tool_result", content: string };
 type Turn = { id: number, user: string, traces: Trace[], answer: string };
+type Usage = {
+    session_id: string;
+    projected_chars: number;
+    watermark_chars: number;
+    dialogue_chars: number;
+    tool_chars: number;
+    system_chars: number;
+    compressed: boolean;
+};
 
 export default function ChatPage() {
     const [turns, setTurns] = useState<Turn[]>([]);
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
+    const [usage, setUsage] = useState<Usage | null>(null);
     const turnIdRef = useRef(0);  // 轮次自增 id
+    const scrollRef = useRef<HTMLDivElement>(null);  // 对话滚动窗口
+
+    // 自动滚到底部：新消息/新 chunk 到达时
+    useEffect(() => {
+        scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    }, [turns]);
+
+    async function loadUsage() {
+        try {
+            const res = await fetch("http://localhost:8000/usage", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ session_id: "test-1" })
+            });
+            setUsage(await res.json());
+        } catch (err) {
+            console.error(err);
+        }
+    }
 
     async function handleSend() {
         if (!input.trim()) return;
@@ -72,6 +101,7 @@ export default function ChatPage() {
             console.error(err);
         } finally {
             setLoading(false);
+            loadUsage();  // 每轮结束刷新水位条
         }
     }
 
@@ -86,8 +116,22 @@ export default function ChatPage() {
         <div className="max-w-2xl mx-auto p-4">
             <h1 className="text-2xl font-bold mb-4">Data Agent</h1>
 
-            {/* 对话流：每轮 = 用户问题 → 轨迹 → 回答 */}
-            <div className="space-y-6 mb-4">
+            {/* 上下文水位条：投影用量构成 + 预算（L20/L22 真实口径） */}
+            {usage && (
+                <div className="mb-4 text-xs text-gray-500">
+                    <div className="flex justify-between mb-1">
+                        <span>上下文 {usage.projected_chars} / {usage.watermark_chars} 字符</span>
+                        <span>对话 {usage.dialogue_chars} · 工具 {usage.tool_chars} · 系统 {usage.system_chars}{usage.compressed ? " · 已压缩" : ""}</span>
+                    </div>
+                    <div className="h-1.5 bg-gray-200 rounded">
+                        <div className="h-full bg-blue-500 rounded transition-all"
+                             style={{ width: `${Math.min(100, usage.projected_chars / usage.watermark_chars * 100)}%` }} />
+                    </div>
+                </div>
+            )}
+
+            {/* 对话流：固定高度滚动窗口，不让消息无限往下堆 */}
+            <div ref={scrollRef} className="h-[70vh] overflow-y-auto space-y-6 mb-4 pr-2">
                 {turns.map(t => (
                     <div key={t.id} className="space-y-2">
                         {/* 用户问题 */}

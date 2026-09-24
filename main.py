@@ -1,26 +1,41 @@
 """
-main.py —— FastAPI 入口（含 SSE 流式 + 会话持久化）
+main.py —— FastAPI 入口（SSE 流式 + 会话持久化 + 预算化压缩）
 
-两个接口：
-  POST /chat          → 非流式
+三个接口：
+  POST /chat          → 非流式（聚合 run_react_stream 的事件）
   POST /chat/stream   → SSE 流式
+  POST /usage         → 前端水位条（投影用量构成）
 
-请求体带 session_id，系统自动加载历史对话。
+L24 重构：本文件回归纯 HTTP 层——
+  投影（context.py）与压缩编排（compaction.py）各自独立成模块。
+L21：_session_pipeline 唯一编排——/chat 与 /chat/stream 走同一套
+     （投影 → next_turn → 落 user → 流式事件 → 落 tool/assistant → 后台压缩），
+     两个入口保存的事件完全一致（P1-2）。
+L22：per-session 压缩锁（防并发双摘要）+ 压缩移入后台 daemon 线程（不阻塞 SSE）。
 """
 import json
+import threading
+
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from react_loop import run_react, run_react_stream
-from session_store import (
-    init_db, save_message, load_messages, project_history,
-    KIND_CONTEXT, KIND_RESULT,
+from react_loop import run_react_stream
+from context import (
+    project_history,
+    WATERMARK_CHARS,
+    KIND_CONTEXT,
+    KIND_RESULT,
 )
+from session_store import (
+    init_db, save_message, load_messages, next_turn, usage_stats,
+)
+from compaction import maybe_compress
 from db import init_db as init_business_db
+from llm import _build_system_prompt
 
-app = FastAPI(title="Data Agent Demo", version="0.4")
+app = FastAPI(title="Data Agent Demo", version="0.6")
 
 # CORS：允许前端 3000 端口跨域访问
 app.add_middleware(
@@ -31,11 +46,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # 启动时建表
 @app.on_event("startup")
 def startup():
     init_db()           # 会话消息表
-    init_business_db() # 业务数据表（orders）
+    init_business_db()  # 业务数据表（orders）
 
 
 class ChatRequest(BaseModel):
@@ -43,29 +59,64 @@ class ChatRequest(BaseModel):
     session_id: str = "default"  # 默认会话，多轮对话时传同一个 id
 
 
+def _session_pipeline(session_id: str, message: str):
+    """
+    唯一编排（L21）：所有请求都走这一条流水线，事件流是唯一输出协议。
+      projected  = 请求开始时的投影（不含本轮）
+      turn       = next_turn：user 开新轮，本轮 tool/assistant 沿用
+      落库顺序：user → tool（按 kind 声明）→ assistant（流式拼接）
+      压缩：事件流结束前启动后台 daemon 线程（SSE 立即关闭，L22 P2-2）
+    """
+    projected = project_history(load_messages(session_id))
+    turn = next_turn(session_id)
+    save_message(session_id, "user", message, turn=turn)
+
+    final_answer = ""
+    for event in run_react_stream(message, projected):
+        if event["type"] == "text_chunk":
+            final_answer += event["content"]
+        elif event["type"] == "tool_result":
+            # 工具结果落库，并声明 kind（判断前置到写入时）：
+            #   get_context 元数据 = 引导性（context），消费完即弃
+            #   execute_sql 结果 = 事实性（result），可被追问引用
+            kind = KIND_CONTEXT if event["name"] == "get_context" \
+                else KIND_RESULT
+            save_message(session_id, "tool", event["output"], kind, turn=turn)
+        elif event["type"] == "text":          # max_iters 兜底分支
+            final_answer = event["content"]
+        yield event
+
+    if final_answer:
+        save_message(session_id, "assistant", final_answer, turn=turn)
+
+    # 压缩交给后台线程：事件流立即结束 → SSE 连接马上关闭（daemon 不拦进程退出）
+    threading.Thread(target=maybe_compress, args=(session_id,), daemon=True).start()
+
+
 @app.get("/")
 def root():
-    return {"status": "ok", "endpoints": ["/chat", "/chat/stream"]}
+    return {"status": "ok", "endpoints": ["/chat", "/chat/stream", "/usage"]}
 
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    # 空消息校验：不落库、不调 LLM（省一次 API 调用）
+    """非流式：聚合 _session_pipeline 的全部事件，返回 answer + trace"""
     if not req.message.strip():
         return {"answer": "请先输入想问的问题。", "trace": []}
-    # 1. 加载全量日志 + 投影出"该给模型看什么"（多轮上下文骨架）
-    projected = project_history(load_messages(req.session_id))
-    # 2. 跑 ReAct（历史骨架传给 LLM，模型记得之前聊过什么）
-    result = run_react(req.message, projected)
-    # 3. 本次对话追加进日志（只追加，永不删）
-    save_message(req.session_id, "user", req.message)
-    save_message(req.session_id, "assistant", result["answer"])
-    return result
+    answer, trace = "", []
+    for event in _session_pipeline(req.session_id, req.message):
+        if event["type"] == "text_chunk":
+            answer += event["content"]
+        elif event["type"] == "text":
+            answer = event["content"]
+        if event["type"] != "text_chunk":
+            trace.append(event)
+    return {"answer": answer, "trace": trace}
 
 
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest):
-    """SSE 流式：逐步推送事件"""
+    """SSE 流式：逐步推送事件（与 /chat 同一条流水线，事件完全一致）"""
     def event_generator():
         # 空消息校验：直接返回友好提示，不调 LLM
         if not req.message.strip():
@@ -73,30 +124,13 @@ def chat_stream(req: ChatRequest):
                 {"type": "text", "content": "请先输入想问的问题。"},
                 ensure_ascii=False) + "\n\n")
             return
-        # 投影：旧历史给模型看；新用户消息稍后再追加进日志
-        projected = project_history(load_messages(req.session_id))
-        # 存用户消息（写入日志）
-        save_message(req.session_id, "user", req.message)
-
-        # 收集 assistant 的最终回答
-        final_answer = ""
-
-        for event in run_react_stream(req.message, projected):
+        for event in _session_pipeline(req.session_id, req.message):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            if event["type"] == "text_chunk":
-                final_answer += event["content"]   # 逐字拼接
-            elif event["type"] == "tool_result":
-                # 工具结果落库，并声明 kind（判断前置到写入时）：
-                #   get_context 元数据 = 引导性（context），消费完即弃
-                #   execute_sql 结果 = 事实性（result），可被追问引用
-                kind = KIND_CONTEXT if event["name"] == "get_context" \
-                    else KIND_RESULT
-                save_message(req.session_id, "tool", event["output"], kind)
-            elif event["type"] == "text":          # max_iters 兜底分支
-                final_answer = event["content"]
-
-        # 存 assistant 回复
-        if final_answer:
-            save_message(req.session_id, "assistant", final_answer)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/usage")
+def usage(req: ChatRequest):
+    """前端水位条：投影用量构成（对话/工具/系统 + 预算 + 是否已压缩）"""
+    return usage_stats(req.session_id, system_chars=len(_build_system_prompt()))

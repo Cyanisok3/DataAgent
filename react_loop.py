@@ -1,60 +1,14 @@
 """
-react_loop.py —— ReAct 循环（流式版）
+react_loop.py —— ReAct 循环（流式版，事件流唯一输出协议）
 
-对应 L2 学的，但现在不是攒完结果再返回，
-而是每一步 yield 一个事件——前端实时看到"想了什么、调了什么工具"。
+L21 清理：删掉非流式 run_react（/chat 聚合也走 run_react_stream），
+事件流是唯一输出形态——前端实时看到"想了什么、调了什么工具"。
 """
 from llm import chat
 from llm import chat_stream_final
 from tools import TOOLS
 
 MAX_ITERS = 10
-
-
-def run_react(user_message: str, history: list[dict] | None = None) -> dict:
-    """非流式版：攒完所有步骤再一次性返回（保留给 /chat 用）
-    history：投影后的历史骨架（多轮上下文），传给 LLM"""
-    messages = [{"role": "user", "content": user_message}]
-    trace = []
-
-    for i in range(MAX_ITERS):
-        # 决策：拿结构化 JSON。解析失败（重试后仍失败）→ 降级为友好提示，
-        # 绝不把异常抛给用户（前端看到 500 是灾难，用户测试尤其如此）。
-        try:
-            result = chat(messages, history)
-        except Exception as e:
-            trace.append({"type": "thinking",
-                          "content": f"模型输出解析失败（{type(e).__name__}），已中止本轮"})
-            return {
-                "answer": "抱歉，模型回复格式异常，请换个问法再试一次。",
-                "trace": trace,
-            }
-        trace.append({"type": "thinking", "content": result["thought"]})
-
-        if "final" in result:
-            trace.append({"type": "text", "content": result["final"]})
-            return {"answer": result["final"], "trace": trace}
-
-        tool_name = result["tool"]
-        tool_args = result["args"]
-        trace.append({"type": "tool_call", "name": tool_name, "input": tool_args})
-
-        # 工具调用兜底：任何异常都转成可读结果，绝不让前端看到 500
-        try:
-            tool_fn = TOOLS[tool_name]["fn"]
-            tool_output = tool_fn(**tool_args)
-        except Exception as e:
-            tool_output = f"❌ 工具 {tool_name} 执行异常: {type(e).__name__}: {e}"
-
-        trace.append({"type": "tool_result", "name": tool_name, "output": tool_output})
-
-        messages.append({"role": "assistant", "content": f"我决定调 {tool_name}"})
-        messages.append({"role": "tool", "content": tool_output})
-
-    return {
-        "answer": f"抱歉，已达最大思考轮数（{MAX_ITERS}）",
-        "trace": trace,
-    }
 
 
 def run_react_stream(user_message: str, history: list[dict] | None = None):

@@ -6,11 +6,12 @@ llm.py —— 接 DeepSeek（兼容 OpenAI API）
 这样更简单可控，零基础好理解。
 
 结构（职责分层，避免两个 chat 各自重复）：
-  _resolve_context()   从当前轮 + 投影历史里取出 (用户问题, 最近工具结果)
-  _build_messages()    组装 API 消息（derive：日志视角 → 模型视角）
-  _completion()        唯一 API 调用入口（stream=False 一次性 / True 生成器）
-  chat()               决策阶段：非流式（必须拿完整 JSON 才能解析 tool/args）
-  chat_stream_final()  回答阶段：流式（人读的文本，逐字输出）
+  _tool_chain()     本轮 ReAct 循环内多步工具结果拼接（L21）
+  _history_text()   投影骨架 → 文本（最终回答阶段拼上下文）
+  _completion()     唯一 API 调用入口（stream=False 一次性 / True 生成器）
+  chat()            决策阶段：非流式（必须拿完整 JSON 才能解析 tool/args）
+  chat_stream_final() 回答阶段：流式（人读的文本，逐字输出）
+  summarize_history() 压缩器：旧段 → 摘要（保留事实数字）
 
 为什么是两个函数而不是一个：
   决策需要结构化 JSON → 必须等完整响应；回答需要逐字体验 → 必须流式。
@@ -33,6 +34,11 @@ client = OpenAI(
 
 MODEL = "deepseek-flash"
 
+# L21：决策阶段拼"本轮工具链"时的单条截断与条数上限
+# （与 session_store.TOOL_RESULT_MAX_CHARS 保持一致；限制防上下文爆掉）
+TOOL_CHAIN_MAX_CHARS = 500
+TOOL_CHAIN_MAX_ITEMS = 5
+
 # System prompt 模板：日期信息每次调用实时注入（对齐原版 AgentService.systemPrompt() 设计）
 # 注意 f-string 里 JSON 的大括号要写成 {{ }} 转义
 _SYSTEM_PROMPT_TEMPLATE = """你是一个数据查询助手。你可以调用以下工具：
@@ -52,6 +58,9 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一个数据查询助手。你可以调用以
 - 收到用户问题后，先调 get_context 了解可用的表和指标
 - 根据 get_context 返回的元数据，写正确的 SQL，再调 execute_sql
 - 拿到 SQL 结果后，直接总结回答，不要再调工具
+- 工具结果可能只保留开头部分（较长时会注明"仅保留开头"），这是正常机制，不是错误：
+  不要为了获取完整数据反复执行同样的查询；基于可见样本回答即可，
+  展示型需求给出总行数与样本数据
 - 如果 execute_sql 返回以 ❌ 开头的错误，说明 SQL 有问题：
   根据错误信息和列名提示修正 SQL 后重试，最多重试 2 次；
   仍失败就用已有的信息直接回答用户，不要重复生成同样的 SQL
@@ -93,25 +102,6 @@ FINAL_SYSTEM_PROMPT = (
 
 # ---------- 公共层 ----------
 
-def _resolve_context(messages: list[dict],
-                     history: list[dict] | None) -> tuple[str, str | None]:
-    """
-    从当前轮消息 + 投影历史里取出 (用户问题, 最近工具结果)。
-    工具结果优先看当前轮（ReAct 循环内刚调完），再看历史投影（跨轮追问）。
-    """
-    user_msg = next(
-        m["content"] for m in reversed(messages) if m["role"] == "user"
-    )
-    tool_output = next(
-        (m["content"] for m in reversed(messages) if m["role"] == "tool"), None
-    )
-    if tool_output is None and history:
-        tool_output = next(
-            (m["content"] for m in reversed(history) if m["role"] == "tool"), None
-        )
-    return user_msg, tool_output
-
-
 def _history_text(history: list[dict] | None) -> str:
     """把投影骨架翻译成文本（供最终回答阶段拼上下文）"""
     if not history:
@@ -124,6 +114,22 @@ def _history_text(history: list[dict] | None) -> str:
         for m in skeleton
     ]
     return "之前的对话：\n" + "\n".join(lines) + "\n\n"
+
+
+def _tool_chain(messages: list[dict]) -> str:
+    """本轮 ReAct 循环内多步工具结果拼接（L21）：
+    只取最新 TOOL_CHAIN_MAX_ITEMS 条，单条 head 截断——决策时模型
+    能看到"最近几步拿到了什么"，而不是只看到最后一步。"""
+    tools = [m for m in messages if m["role"] == "tool"]
+    lines = []
+    for m in tools[-TOOL_CHAIN_MAX_ITEMS:]:
+        c = m["content"]
+        if len(c) > TOOL_CHAIN_MAX_CHARS:
+            c = c[:TOOL_CHAIN_MAX_CHARS] + "…（结果较长，仅保留开头）"
+        lines.append(f"- {c}")
+    if not lines:
+        return ""
+    return "本轮工具已返回：\n" + "\n".join(lines)
 
 
 def _completion(api_messages: list[dict], stream: bool = False):
@@ -153,8 +159,13 @@ def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
     决策阶段（非流式）：返回结构化 JSON，供 ReAct 循环解析工具调用。
     输入：当前轮消息 + 投影后的历史（可选）
     输出：{"thought":..., "tool":..., "args":...} 或 {"thought":..., "final":...}
+
+    L21：决策上下文 = 本轮工具链（多步，_tool_chain）+ 历史投影里的事实结果
+         （hist_tools）——追问时模型能看到旧数字，而不是只看到本轮最后一步。
     """
-    user_msg, tool_output = _resolve_context(messages, history)
+    user_msg = next(
+        m["content"] for m in reversed(messages) if m["role"] == "user"
+    )
 
     # derive：投影骨架里的 user/assistant 多轮直传（合法角色）；
     # 工具结果不能以 role=tool 直传（OpenAI 协议要求 tool_call_id 配对），
@@ -165,14 +176,19 @@ def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
             m for m in history if m["role"] in ("user", "assistant")
         )
 
-    if tool_output:
-        user_content = (
-            f"用户问题：{user_msg}\n\n"
-            f"上一步工具返回：\n{tool_output}\n\n"
-            f"请基于以上信息决定下一步：调工具或直接回答。"
-        )
-    else:
-        user_content = user_msg
+    parts = []
+    chain = _tool_chain(messages)
+    if chain:
+        parts.append(chain)
+    hist_tools = [m["content"] for m in (history or []) if m["role"] == "tool"]
+    if hist_tools:
+        parts.append("历史查询过的事实结果：\n"
+                     + "\n".join(f"- {c}" for c in hist_tools))
+
+    user_content = f"用户问题：{user_msg}"
+    if parts:
+        user_content += "\n\n" + "\n\n".join(parts)
+    user_content += "\n\n请基于以上信息决定下一步：调工具或直接回答。"
     api_messages.append({"role": "user", "content": user_content})
 
     # JSON 解析带一次错误反馈重试：
@@ -200,16 +216,47 @@ def chat_stream_final(user_message: str, tool_output: str,
     """
     回答阶段（流式）：逐字生成最终回答，供前端实时渲染。
     不用 JSON 协议，直接生成自然语言。
+
+    L22 P1-1：当前轮工具结果 + 历史投影里的工具事实都要带上——
+    追问（本轮无工具调用）时，模型仍能看到上一轮的具体数字。
     """
+    parts = []
+    if tool_output:
+        parts.append(f"工具返回结果：\n{tool_output}")
+    hist_tools = [m["content"] for m in (history or []) if m["role"] == "tool"]
+    if hist_tools:
+        parts.append("历史查询过的事实结果：\n"
+                     + "\n".join(f"- {c}" for c in hist_tools))
+
+    body = f"{_history_text(history)}用户问题：{user_message}\n\n"
+    if parts:
+        body += "\n\n".join(parts)
+
     api_messages = [
         {"role": "system", "content": FINAL_SYSTEM_PROMPT},
-        {"role": "user",
-         "content": f"{_history_text(history)}用户问题：{user_message}\n\n"
-                    f"工具返回结果：\n{tool_output}"},
+        {"role": "user", "content": body},
     ]
     for chunk in _completion(api_messages, stream=True):
         if chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
+
+
+def summarize_history(messages: list[dict]) -> str:
+    """把要压缩的旧段压成中文摘要（L20 压缩器）：
+    必须保留关键事实：具体数字、表名、指标名、统计口径、最终结论。
+    忽略思考过程和工具调用细节。失败/空返回 ""（压缩可跳过）。"""
+    text = "\n".join(
+        f"{'用户' if m['role'] == 'user' else '助手'}：{m['content']}"
+        for m in messages
+    )
+    resp = _completion([
+        {"role": "system",
+         "content": "你是对话压缩器。把下面的对话压缩成简洁的中文摘要，"
+                    "必须保留关键事实：具体数字、表名、指标名、统计口径、最终结论。"
+                    "忽略思考过程和工具调用细节。只输出摘要本身。"},
+        {"role": "user", "content": text},
+    ])
+    return (resp.choices[0].message.content or "").strip()
 
 
 # 自测
