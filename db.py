@@ -176,7 +176,7 @@ def execute_query(sql: str) -> str:
         for row in rows[:20]:  # 最多显示 20 行
             lines.append(str(dict(row._mapping)))
         if len(rows) > 20:
-            lines.append(f"... 还有 {len(rows) - 20} 行未显示")
+            lines.append(f"（已截断，仅显示前 20 行，共 {len(rows)} 行）")
 
         return "\n".join(lines)
 
