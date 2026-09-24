@@ -9,19 +9,23 @@ session_store.py —— 会话持久化（SQLite 存储层 + 压缩账本层）
 
 依赖方向（单向无环）：context（纯函数）← session_store ← compaction ← main
 """
+import os
 import sqlite3
 
 from context import (
-    WATERMARK_CHARS,
+    CONTEXT_WINDOW_TOKENS,
     SUMMARY_MAX_CHARS,
     KIND_CHAT,
     KIND_CONTEXT,
     KIND_RESULT,
+    estimate_tokens,
     project_history,
     find_compressible,
+    truncate_sentence,
 )
 
-DB_PATH = "sessions.db"
+# 测试时可用 SESSION_DB_PATH 指向临时库（不碰产品 sessions.db）
+DB_PATH = os.environ.get("SESSION_DB_PATH", "sessions.db")
 
 
 def _get_conn():
@@ -127,14 +131,16 @@ def load_messages(session_id: str) -> list[dict]:
 
 def apply_summary(session_id: str, segment: list[dict], summary_text: str):
     """压缩落库：插入摘要行（is_summary=1, replaces_range）+ 旧行打 replaced_by。
-    只改不删——被吸收的消息一行都不删，只是不再进投影。"""
+    只改不删——被吸收的消息一行都不删，只是不再进投影。
+    摘要在句子边界截断（L25 修复：旧版 [:400] 硬切会切断数字/口径）。"""
     conn = _get_conn()
     first_id = segment[0]["id"]
     last_id = segment[-1]["id"]
+    safe_summary = truncate_sentence(summary_text, SUMMARY_MAX_CHARS)
     cur = conn.execute(
         "INSERT INTO messages (session_id, role, content, kind, is_summary, "
         "replaces_range) VALUES (?, ?, ?, ?, 1, ?)",
-        (session_id, "assistant", summary_text[:SUMMARY_MAX_CHARS], KIND_CHAT,
+        (session_id, "assistant", safe_summary, KIND_CHAT,
          f"{first_id}-{last_id}"),
     )
     summary_id = cur.lastrowid
@@ -148,26 +154,24 @@ def apply_summary(session_id: str, segment: list[dict], summary_text: str):
     conn.close()
 
 
-def usage_stats(session_id: str, system_chars: int = 0) -> dict:
-    """前端水位条数据（L20 + L22 真实口径）：
-    projected_chars 不含系统提示词，与 WATERMARK_CHARS 同口径比较；
-    compressed 是真实值（存在未被替代的摘要 = True）。"""
+def usage_stats(session_id: str) -> dict:
+    """历史投影的 token 用量分项（L25 token 口径）：
+    系统提示词由 llm 侧计算、main 组装总量；compressed 是真实值。"""
     history = load_messages(session_id)
     projected = project_history(history)
-    projected_chars = sum(len(m["content"]) for m in projected)
-    dialogue_chars = sum(len(m["content"]) for m in projected
-                         if m["role"] in ("user", "assistant"))
-    tool_chars = sum(len(m["content"]) for m in projected
-                     if m["role"] == "tool")
+    dialogue_tokens = sum(estimate_tokens(m["content"])
+                          for m in projected
+                          if m["role"] in ("user", "assistant"))
+    tool_tokens = sum(estimate_tokens(m["content"])
+                      for m in projected if m["role"] == "tool")
     summaries = [m for m in history
                  if m.get("is_summary") and not m.get("replaced_by")]
     return {
         "session_id": session_id,
-        "projected_chars": projected_chars,
-        "watermark_chars": WATERMARK_CHARS,
-        "dialogue_chars": dialogue_chars,
-        "tool_chars": tool_chars,
-        "system_chars": system_chars,
+        "projected_tokens": dialogue_tokens + tool_tokens,
+        "context_window_tokens": CONTEXT_WINDOW_TOKENS,
+        "dialogue_tokens": dialogue_tokens,
+        "tool_tokens": tool_tokens,
         "compressed": bool(summaries),
     }
 

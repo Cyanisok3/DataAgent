@@ -22,8 +22,10 @@ _compress_locks_guard = threading.Lock()
 
 def maybe_compress(session_id: str):
     """压缩：找装不下的旧段 → LLM 摘要 → 落账本。
-    投影按 WATERMARK_CHARS 预算从新往回装；find_compressible 返回
-    投影装不下的旧段——这就是"该压缩什么"的判定（同口径）。"""
+    投影按 WATERMARK_TOKENS 预算从新往回装；find_compressible 返回
+    投影装不下的旧段——这就是"该压缩什么"的判定（同口径）。
+    deepseek-flash 窗口 1M token，正常会话不会走到这里；
+    罕见路径也必须正确，异常显式打印、不静默吞掉。"""
     with _compress_locks_guard:
         lock = _compress_locks.setdefault(session_id, threading.Lock())
     with lock:

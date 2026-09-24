@@ -1,4 +1,4 @@
-# Python 版 DataAgent 后端依赖（L7 起逐步引入）
+# Python 版 DataAgent 后端依赖
 # 安装：pip install -r requirements.txt
 
 # Web 框架（main.py）
@@ -10,3 +10,11 @@ openai>=1.0.0
 
 # SQL 解析与方言改写（sql_guard.py）
 sqlglot>=20.0.0
+
+# 数据库访问（db.py）
+sqlalchemy>=2.0.0
+
+# 开发工具链（可选）
+ruff>=0.6.0
+pytest>=7.0.0
+mypy>=1.0.0

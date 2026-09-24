@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from react_loop import run_react_stream
 from context import (
     project_history,
-    WATERMARK_CHARS,
+    CONTEXT_TOOLS,
     KIND_CONTEXT,
     KIND_RESULT,
 )
@@ -33,9 +33,9 @@ from session_store import (
 )
 from compaction import maybe_compress
 from db import init_db as init_business_db
-from llm import _build_system_prompt
+from llm import system_prompt_tokens
 
-app = FastAPI(title="Data Agent Demo", version="0.6")
+app = FastAPI(title="Data Agent", version="0.7")
 
 # CORS：允许前端 3000 端口跨域访问
 app.add_middleware(
@@ -76,12 +76,15 @@ def _session_pipeline(session_id: str, message: str):
         if event["type"] == "text_chunk":
             final_answer += event["content"]
         elif event["type"] == "tool_result":
-            # 工具结果落库，并声明 kind（判断前置到写入时）：
-            #   get_context 元数据 = 引导性（context），消费完即弃
+            # 工具结果落库（kind 在写入时声明，按工具名集合判定）：
+            #   schema/口径/表清单 = 引导性（context），消费完即弃
             #   execute_sql 结果 = 事实性（result），可被追问引用
-            kind = KIND_CONTEXT if event["name"] == "get_context" \
-                else KIND_RESULT
-            save_message(session_id, "tool", event["output"], kind, turn=turn)
+            kind = (KIND_CONTEXT if event["name"] in CONTEXT_TOOLS
+                    else KIND_RESULT)
+            # header 记录工具名+参数（L25 审计修复：旧日志看不到调用参数）
+            header = f"[{event['name']}({json.dumps(event.get('input', {}), ensure_ascii=False)})]"
+            save_message(session_id, "tool", f"{header}\n{event['output']}",
+                         kind, turn=turn)
         elif event["type"] == "text":          # max_iters 兜底分支
             final_answer = event["content"]
         yield event
@@ -130,7 +133,12 @@ def chat_stream(req: ChatRequest):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@app.post("/usage")
-def usage(req: ChatRequest):
-    """前端水位条：投影用量构成（对话/工具/系统 + 预算 + 是否已压缩）"""
-    return usage_stats(req.session_id, system_chars=len(_build_system_prompt()))
+@app.get("/usage")
+def usage(session_id: str = "default"):
+    """前端水位条：token 用量构成（对话/工具/系统 + 水位 + 是否已压缩）。
+    只读 → GET + query 参数。总量 = 历史投影 + 系统提示词。"""
+    stats = usage_stats(session_id)
+    system_tokens = system_prompt_tokens()
+    stats["system_tokens"] = system_tokens
+    stats["projected_tokens"] += system_tokens
+    return stats

@@ -8,11 +8,11 @@ type Trace = { type: "thinking" | "tool_call" | "tool_result", content: string }
 type Turn = { id: number, user: string, traces: Trace[], answer: string };
 type Usage = {
     session_id: string;
-    projected_chars: number;
-    watermark_chars: number;
-    dialogue_chars: number;
-    tool_chars: number;
-    system_chars: number;
+    projected_tokens: number;
+    context_window_tokens: number;
+    dialogue_tokens: number;
+    tool_tokens: number;
+    system_tokens: number;
     compressed: boolean;
 };
 
@@ -31,11 +31,7 @@ export default function ChatPage() {
 
     async function loadUsage() {
         try {
-            const res = await fetch("http://localhost:8000/usage", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ session_id: "test-1" })
-            });
+            const res = await fetch("http://localhost:8000/usage?session_id=test-1");
             setUsage(await res.json());
         } catch (err) {
             console.error(err);
@@ -115,17 +111,20 @@ export default function ChatPage() {
     return (
         <div className="max-w-2xl mx-auto p-4">
             <h1 className="text-2xl font-bold mb-4">Data Agent</h1>
+            <p className="text-sm text-gray-500 mb-4">
+                这是一个基于 DataAgent 的聊天界面，可以与 AI 模型进行交互。
+            </p>
 
             {/* 上下文水位条：投影用量构成 + 预算（L20/L22 真实口径） */}
             {usage && (
                 <div className="mb-4 text-xs text-gray-500">
                     <div className="flex justify-between mb-1">
-                        <span>上下文 {usage.projected_chars} / {usage.watermark_chars} 字符</span>
-                        <span>对话 {usage.dialogue_chars} · 工具 {usage.tool_chars} · 系统 {usage.system_chars}{usage.compressed ? " · 已压缩" : ""}</span>
+                        <span>上下文 {usage.projected_tokens} / {usage.context_window_tokens} tokens</span>
+                        <span>对话 {usage.dialogue_tokens} · 工具 {usage.tool_tokens} · 系统 {usage.system_tokens}{usage.compressed ? " · 已压缩" : ""}</span>
                     </div>
                     <div className="h-1.5 bg-gray-200 rounded">
                         <div className="h-full bg-blue-500 rounded transition-all"
-                             style={{ width: `${Math.min(100, usage.projected_chars / usage.watermark_chars * 100)}%` }} />
+                             style={{ width: `${Math.min(100, usage.projected_tokens / usage.context_window_tokens * 100)}%` }} />
                     </div>
                 </div>
             )}

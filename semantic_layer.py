@@ -43,11 +43,15 @@ class Metric:
     key: str            # 机器名：sales
     name: str           # 中文名：销售额
     description: str    # 描述：所有订单的总金额
-    table: str          # 来自哪张表
+    table: str          # 主表：指标表达式所在的表
     sql_expression: str # 计算表达式：SUM(order_total)
     time_field: str     # 时间字段：ordered_at
     filters: str        # 过滤条件（jaffle 无状态，留空）
     aliases: list[str] = field(default_factory=list)  # 别名：用户可能说的其他说法
+    # 依赖闭包：计算该指标必须参与 JOIN 的表（主表之外）。
+    # 审计修复——问"商品销量"时，items 之外还必须有 orders（时间过滤）
+    # 和 products（商品名），否则召回的表集合不足以完成统计。
+    related_tables: list[str] = field(default_factory=list)
 
 
 # ─── 元数据（对应项目的 domain_info / table_info / metric_info）───
@@ -203,6 +207,8 @@ METRICS = {
         time_field="",
         filters="",
         aliases=["卖了多少件", "销售件数", "售出多少", "商品销量", "卖", "销量"],
+        # 按商品统计销量必须 JOIN：orders（时间范围）、products（商品名称）
+        related_tables=["orders", "products"],
     ),
 }
 
@@ -240,12 +246,15 @@ def match_tables(question: str, domains: list[Domain],
         if any(kw in question for kw in t.keywords):
             keyword_hits.append(t)
 
-    # 指标依赖的表（指标是业务问题的锚点：问"销售额"就必须有 orders 表）
+    # 指标依赖闭包（指标是业务问题的锚点）：主表 + related_tables 全部带出，
+    # 例如"商品销量"命中 items_sold → items + orders（时间）+ products（名称）
     metric_tables = []
     for m in (metrics or []):
-        for t in TABLES:
-            if t.name == m.table and t.is_visible and t not in metric_tables:
-                metric_tables.append(t)
+        needed = [m.table, *m.related_tables]
+        for name in needed:
+            for t in TABLES:
+                if t.name == name and t.is_visible and t not in metric_tables:
+                    metric_tables.append(t)
 
     merged = keyword_hits + [t for t in metric_tables if t not in keyword_hits]
     # 兜底：一个都没命中 → 返回域内全部可见表

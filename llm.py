@@ -22,6 +22,13 @@ import sqlite3
 from datetime import date, timedelta
 from openai import OpenAI
 
+from context import (
+    KIND_RESULT,
+    SUMMARY_MAX_CHARS,
+    estimate_tokens,
+    tool_result_view,
+)
+
 # 读 API key（从文件读，不硬编码）
 with open("api_key.txt") as f:
     API_KEY = f.read().strip()
@@ -34,36 +41,33 @@ client = OpenAI(
 
 MODEL = "deepseek-flash"
 
-# L21：决策阶段拼"本轮工具链"时的单条截断与条数上限
-# （与 session_store.TOOL_RESULT_MAX_CHARS 保持一致；限制防上下文爆掉）
-TOOL_CHAIN_MAX_CHARS = 500
-TOOL_CHAIN_MAX_ITEMS = 5
+# 决策阶段拼"本轮工具链"时最多回看几条（细粒度工具单条很短，可多看几步）
+TOOL_CHAIN_MAX_ITEMS = 8
 
 # System prompt 模板：日期信息每次调用实时注入（对齐原版 AgentService.systemPrompt() 设计）
 # 注意 f-string 里 JSON 的大括号要写成 {{ }} 转义
 _SYSTEM_PROMPT_TEMPLATE = """你是一个数据查询助手。你可以调用以下工具：
 
-1. get_context(question: str) —— 根据用户问题，匹配相关的数据域、表和指标元数据
-2. execute_sql(sql: str) —— 执行 SELECT SQL 查询数据库
+1. get_domains() —— 获取所有可用数据域
+2. get_tables(question) —— 根据问题列出相关表（只给表名+描述）
+3. get_table_schema(table_name) —— 获取单表完整列信息（列名+业务含义）
+4. get_metric_caliber(hint) —— 获取指标口径（计算表达式、时间字段、过滤条件）
+5. execute_sql(sql) —— 执行 SELECT 查询
 
 当前日期信息（时区 Asia/Shanghai）：
-- 今天是 {today}
-- 昨天是 {yesterday}
-- 明天是 {tomorrow}
+- 今天是 {today}；昨天是 {yesterday}；明天是 {tomorrow}
 - 数据库中的订单数据最新到 {data_end}
 
-规则：
-- 用户提到"今天/昨天/最近 N 天/上周/本月"等相对日期时，先按上面的当前日期换算成具体日期，
-  再写 SQL（可以直接用 CURRENT_DATE 计算）
-- 收到用户问题后，先调 get_context 了解可用的表和指标
-- 根据 get_context 返回的元数据，写正确的 SQL，再调 execute_sql
-- 拿到 SQL 结果后，直接总结回答，不要再调工具
-- 工具结果可能只保留开头部分（较长时会注明"仅保留开头"），这是正常机制，不是错误：
-  不要为了获取完整数据反复执行同样的查询；基于可见样本回答即可，
-  展示型需求给出总行数与样本数据
-- 如果 execute_sql 返回以 ❌ 开头的错误，说明 SQL 有问题：
-  根据错误信息和列名提示修正 SQL 后重试，最多重试 2 次；
-  仍失败就用已有的信息直接回答用户，不要重复生成同样的 SQL
+工作流程（严格遵守）：
+1. 用 get_tables 找到相关表；写 SQL 前必须用 get_table_schema 确认列名与时间字段
+2. 涉及销售额/订单量/客单价/活跃客户数/销量等指标时，先调 get_metric_caliber
+   获取标准口径，严格使用其表达式与过滤条件，不要自己发明算法
+3. 写 SQL，调 execute_sql；拿到结果后直接总结回答，不再调工具
+4. "今天/昨天/最近 N 天/上周/本月"等相对日期，按上面的当前日期换算
+   （可直接用 CURRENT_DATE 计算）
+5. execute_sql 返回以 ❌ 开头的错误时：调 get_table_schema 核对列名后重写，
+   不要重复同样的错误 SQL；重试 2 次仍失败就基于已有信息回答
+6. 不要重复调用目的与参数完全相同的工具；已拿到所需信息就直接进入下一步
 
 你必须严格按以下 JSON 格式回复（不要加任何其他文字、不要用 markdown 代码块）：
 - 想调工具时：{{"thought": "你的思考", "tool": "工具名", "args": {{"参数名": "参数值"}}}}
@@ -93,10 +97,21 @@ def _build_system_prompt() -> str:
         data_end=_latest_order_time(),
     )
 
+
+def system_prompt_tokens() -> int:
+    """当前系统提示词的 token 估算（/usage 水位条用；日期每天变化故实时算）。"""
+    return estimate_tokens(_build_system_prompt())
+
 # 最终回答阶段的 system prompt：纯总结，不要 JSON、不要思考过程
+# L25 证据约束：事实与推测分开，趋势/原因类结论必须有计算或数据支撑
 FINAL_SYSTEM_PROMPT = (
-    "你是数据查询助手。根据工具返回的结果，用简洁清晰的语言总结回答用户，"
-    "直接输出回答内容，不要加思考过程。"
+    "你是数据查询助手。根据已有的数据与计算结果，用简洁清晰的语言回答用户。\n"
+    "严格遵守：\n"
+    "1. 只陈述已经计算或数据中明确存在的事实，具体数字保持原样\n"
+    "2. 增长、下降、反超、趋势等判断，必须有对应计算支撑（等长前期对比、同比、"
+    "按月序列等）；没有计算就明确写“需补充数据验证”，不得直接断言\n"
+    "3. 原因解释（促销、旺季、活动等）必须有事件数据支持，否则标注为推测或不写\n"
+    "4. 回答中事实、推测、建议分开呈现。直接输出回答，不要思考过程。"
 )
 
 
@@ -117,19 +132,27 @@ def _history_text(history: list[dict] | None) -> str:
 
 
 def _tool_chain(messages: list[dict]) -> str:
-    """本轮 ReAct 循环内多步工具结果拼接（L21）：
-    只取最新 TOOL_CHAIN_MAX_ITEMS 条，单条 head 截断——决策时模型
-    能看到"最近几步拿到了什么"，而不是只看到最后一步。"""
+    """本轮 ReAct 循环内工具结果拼接（L25 重写）：
+    复用 context.tool_result_view（截断口径唯一），并检测完全重复的返回——
+    审计中模型反复拿到相同片段却继续同样的调用，此处显式警告。"""
     tools = [m for m in messages if m["role"] == "tool"]
-    lines = []
+    seen: set[str] = set()
+    lines: list[str] = []
+    duplicate = False
     for m in tools[-TOOL_CHAIN_MAX_ITEMS:]:
-        c = m["content"]
-        if len(c) > TOOL_CHAIN_MAX_CHARS:
-            c = c[:TOOL_CHAIN_MAX_CHARS] + "…（结果较长，仅保留开头）"
-        lines.append(f"- {c}")
+        view = tool_result_view(m["content"], m.get("kind", KIND_RESULT))
+        if view in seen:
+            duplicate = True
+            continue
+        seen.add(view)
+        lines.append(f"- {view}")
     if not lines:
         return ""
-    return "本轮工具已返回：\n" + "\n".join(lines)
+    out = "本轮工具已返回：\n" + "\n".join(lines)
+    if duplicate:
+        out += ("\n⚠ 有工具返回与之前完全相同（无新增信息）：不要重复同样的调用，"
+                "请换参数/工具，或基于已有信息直接回答。")
+    return out
 
 
 def _completion(api_messages: list[dict], stream: bool = False):
@@ -180,7 +203,8 @@ def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
     chain = _tool_chain(messages)
     if chain:
         parts.append(chain)
-    hist_tools = [m["content"] for m in (history or []) if m["role"] == "tool"]
+    hist_tools = [tool_result_view(m["content"], KIND_RESULT)
+                  for m in (history or []) if m["role"] == "tool"]
     if hist_tools:
         parts.append("历史查询过的事实结果：\n"
                      + "\n".join(f"- {c}" for c in hist_tools))
@@ -223,7 +247,8 @@ def chat_stream_final(user_message: str, tool_output: str,
     parts = []
     if tool_output:
         parts.append(f"工具返回结果：\n{tool_output}")
-    hist_tools = [m["content"] for m in (history or []) if m["role"] == "tool"]
+    hist_tools = [tool_result_view(m["content"], KIND_RESULT)
+                  for m in (history or []) if m["role"] == "tool"]
     if hist_tools:
         parts.append("历史查询过的事实结果：\n"
                      + "\n".join(f"- {c}" for c in hist_tools))
@@ -242,18 +267,21 @@ def chat_stream_final(user_message: str, tool_output: str,
 
 
 def summarize_history(messages: list[dict]) -> str:
-    """把要压缩的旧段压成中文摘要（L20 压缩器）：
-    必须保留关键事实：具体数字、表名、指标名、统计口径、最终结论。
-    忽略思考过程和工具调用细节。失败/空返回 ""（压缩可跳过）。"""
+    """把要压缩的旧段压成中文摘要（L25 强化保真）：
+    原样保留所有数字/日期/表名/口径/结论；不保留过程性状态（等待授权等）；
+    忽略思考与工具调用细节。失败/空返回 ""（压缩可跳过）。"""
     text = "\n".join(
         f"{'用户' if m['role'] == 'user' else '助手'}：{m['content']}"
         for m in messages
     )
     resp = _completion([
         {"role": "system",
-         "content": "你是对话压缩器。把下面的对话压缩成简洁的中文摘要，"
-                    "必须保留关键事实：具体数字、表名、指标名、统计口径、最终结论。"
-                    "忽略思考过程和工具调用细节。只输出摘要本身。"},
+         "content": "你是对话压缩器。把下面的旧对话压成简洁中文摘要，严格遵守：\n"
+                    "1. 原样保留所有具体数字、日期、表名、指标口径与最终结论\n"
+                    "2. 不保留“等待授权/待确认/需继续”等过程性状态\n"
+                    "3. 忽略思考过程与工具调用细节\n"
+                    f"4. 摘要控制在 {SUMMARY_MAX_CHARS} 字以内\n"
+                    "只输出摘要本身。"},
         {"role": "user", "content": text},
     ])
     return (resp.choices[0].message.content or "").strip()
