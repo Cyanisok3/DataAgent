@@ -8,11 +8,11 @@ context.py —— 投影层（纯函数，不碰任何 IO）
 本文件全是纯函数，零内部 import；session_store / compaction 反向依赖这里。
 消息分类契约（KIND_*）、工具结果视图、token 估算也集中在这里。
 
-L25 审计修复：
-  - 水位按 token 计量，对齐模型真实窗口（deepseek-flash = 1M token），
-    压缩只在投影真实越过水位时触发（旧版 6000 字符 ≈ 窗口 0.5%，属过早优化）
-  - _round_cost 与 project_history 同口径（只算实际会投影的事实条数）
-  - 截断在句子边界进行；工具结果视图收敛为单一函数（llm 复用）
+L27：结果索引 + 按需读取（替代"最近 N 条完整结果"硬选择）
+  - 历史 kind=result 不再投影完整内容，改为一条合并的精简索引列表
+  - 每条索引 ~100 字（ID + SQL 摘要 + 行数 + 前 2 行预览），30 条也才 3000 字
+  - 模型需要完整数据时调 read_result(result_id=ID) 按需拉取
+  - 预算计算只算对话（事实结果不占实时投影预算），可保留更多轮
 """
 # ─── 窗口与预算常量 ────────────────────────────────────────
 CONTEXT_WINDOW_TOKENS = 256_000   # deepseek-flash 上下文窗口（换模型时改这里）
@@ -20,10 +20,12 @@ WATERMARK_RATIO = 0.8               # 安全系数：水位 = 窗口 × 0.8
 WATERMARK_TOKENS = int(CONTEXT_WINDOW_TOKENS * WATERMARK_RATIO)  # 204k
 
 MIN_TURNS = 1               # 保底：预算再紧张也至少保留最近 1 个完整轮
-MAX_TOOL_RESULTS = 4        # 事实性结果最多投影几条（支持多 SQL 联合/追问）
+
+# 结果索引（L27）：最多保留多少条历史查询结果的精简索引
+RESULT_INDEX_MAX = 30
 
 # 单条内容字符上限（兜底防爆；细粒度工具的返回天然远小于这些值）
-RESULT_MAX_CHARS = 2000     # execute_sql 数据结果
+RESULT_MAX_CHARS = 2000     # execute_sql 数据结果（read_result 拉取时兜底截断）
 CONTEXT_MAX_CHARS = 1500    # 引导类工具结果（schema/口径/表清单）
 DIALOGUE_MAX_CHARS = 4000   # user/assistant 对话
 SUMMARY_MAX_CHARS = 800     # 摘要消息
@@ -31,11 +33,13 @@ SUMMARY_MAX_CHARS = 800     # 摘要消息
 # 消息分类（写日志时声明，投影时按规则过滤）
 KIND_CHAT = "chat"        # 对话消息（user/assistant）
 KIND_CONTEXT = "context"  # 引导性元数据：消费完即弃，不进跨轮投影
-KIND_RESULT = "result"    # 事实性查询结果（execute_sql）：可被追问引用
+KIND_RESULT = "result"    # 事实性查询结果（execute_sql 成功）：可被追问引用
+KIND_ERROR = "error"      # 工具执行失败（SQL 错误/护栏拒绝）：不占事实名额，留档审计
 
 # 哪些工具的返回属于引导类（其余工具默认事实类）
 CONTEXT_TOOLS = {
     "get_domains", "get_tables", "get_table_schema", "get_metric_caliber",
+    "read_result",  # L27：按需读取的历史结果，消费完即弃
 }
 
 
@@ -79,6 +83,43 @@ def _dialogue_view(m: dict) -> str:
     return c
 
 
+def build_result_index(history: list[dict]) -> str:
+    """从历史中提取 kind=result 的消息，生成精简索引列表（L27）。
+    每条：#id [turn=N]: SQL前60字 (行数) 预览: 前2行
+    索引本身很小（每条~100字），30条也才3000字——替代"最后4条完整结果"。
+    模型需要完整数据时调 read_result(result_id=ID) 按需拉取。"""
+    results = [m for m in history
+               if m["role"] == "tool" and m.get("kind") == KIND_RESULT
+               and not m.get("replaced_by")]
+    if not results:
+        return ""
+    lines = ["[历史查询结果索引 — 需要完整数据时调用 read_result(result_id=ID)]"]
+    for m in results[-RESULT_INDEX_MAX:]:
+        content = m["content"]
+        # 提取实际执行 SQL（header 中 "→ SQL: " 之后到 "]" 之前）
+        sql = ""
+        sql_start = content.find("→ SQL: ")
+        if sql_start >= 0:
+            sql_end = content.find("]", sql_start)
+            if sql_end >= 0:
+                sql = content[sql_start + 7:sql_end][:60]
+        if not sql:
+            sql = content[:60].replace("\n", " ")
+        # 提取行数
+        rows_info = ""
+        if "Total rows:" in content:
+            rs = content.find("Total rows:")
+            re = content.find("\n", rs)
+            if re >= 0:
+                rows_info = content[rs:re]
+        # 提取前 2 行数据预览（以 { 开头的行）
+        data_lines = [l for l in content.split("\n") if l.startswith("{")][:2]
+        preview = " | ".join(data_lines)[:80]
+        lines.append(f"#{m['id']} [turn={m.get('turn', '?')}]: {sql} "
+                     f"({rows_info}) 预览: {preview}")
+    return "\n".join(lines)
+
+
 # ─── 同口径预算分配 ────────────────────────────────────────
 
 def _budget_split(history: list[dict]) -> tuple:
@@ -114,26 +155,20 @@ def _budget_split(history: list[dict]) -> tuple:
     return summaries, rounds, factual_by_turn, budget
 
 
-def _round_cost(r: list[dict], factual_by_turn: dict[int, list[dict]]) -> int:
-    """一轮的投影成本（与 project_history 同口径，L25 修复虚高）：
-    该轮对话 + 该轮事实中【实际会投影的最后 MAX_TOOL_RESULTS 条】，
-    而不是该轮产生过的全部工具结果。"""
-    cost = sum(estimate_tokens(_dialogue_view(m)) for m in r)
-    facts = factual_by_turn.get(r[0].get("turn", 0), [])
-    for m in facts[-MAX_TOOL_RESULTS:]:
-        cost += estimate_tokens(tool_result_view(m["content"], KIND_RESULT))
-    return cost
+def _round_cost(r: list[dict]) -> int:
+    """一轮的投影成本（L27：事实结果不投影完整内容，只算对话）。
+    结果索引是一条合并消息，成本固定且很小，不计入每轮成本。"""
+    return sum(estimate_tokens(_dialogue_view(m)) for m in r)
 
 
 def _fit_rounds(rounds: list[list[dict]],
-                factual_by_turn: dict[int, list[dict]],
                 budget: int,
                 min_rounds: int = MIN_TURNS) -> tuple:
     """从最新轮往回装：预算不足停；保底至少 min_rounds 个完整轮。
     返回 (保留[正序], 丢弃[正序])"""
     kept, used = [], 0
     for r in reversed(rounds):
-        cost = _round_cost(r, factual_by_turn)
+        cost = _round_cost(r)
         if len(kept) < min_rounds or used + cost <= budget:
             kept.append(r)
             used += cost
@@ -152,14 +187,13 @@ def project_history(history: list[dict]) -> list[dict]:
 
       1. 摘要（观点）：有效摘要前置，不可丢
       2. 对话：按 token 预算从新往回装（至少 MIN_TURNS 个完整轮）
-      3. 事实：只取【保留轮次内】kind=result 的最后 MAX_TOOL_RESULTS 条；
-         kind=context 一律不进跨轮投影（一次性引导，需要时重新调工具）
+      3. 结果索引（L27）：所有 kind=result 的历史查询生成精简索引列表，
+         合并为一条 tool 消息；模型需要完整数据时调 read_result(result_id=ID)
 
     旧消息不删除、不修改——只是不投影。
     """
-    summaries, rounds, factual_by_turn, budget = _budget_split(history)
-    kept_rounds, _ = _fit_rounds(rounds, factual_by_turn, budget)
-    kept_turns = {r[0].get("turn", 0) for r in kept_rounds}
+    summaries, rounds, _, budget = _budget_split(history)
+    kept_rounds, _ = _fit_rounds(rounds, budget)
 
     view: list[dict] = []
     for s in summaries:
@@ -170,12 +204,10 @@ def project_history(history: list[dict]) -> list[dict]:
         for m in r:
             view.append({"role": m["role"], "content": _dialogue_view(m)})
 
-    bound = [m for m in history
-             if m["role"] == "tool" and m.get("kind") == KIND_RESULT
-             and m.get("turn") in kept_turns]
-    for m in bound[-MAX_TOOL_RESULTS:]:
-        view.append({"role": "tool",
-                     "content": tool_result_view(m["content"], KIND_RESULT)})
+    # 结果索引（替代之前的"最后 N 条完整结果"）
+    index = build_result_index(history)
+    if index:
+        view.append({"role": "tool", "content": index})
 
     return view
 
@@ -187,7 +219,7 @@ def find_compressible(history: list[dict]) -> list[dict]:
     段内容 = 丢弃的旧轮对话 + 旧轮绑定的事实 + 旧摘要（摘要模型看得见真数字）。
     """
     summaries, rounds, factual_by_turn, budget = _budget_split(history)
-    _, dropped = _fit_rounds(rounds, factual_by_turn, budget)
+    _, dropped = _fit_rounds(rounds, budget)
     if not dropped:
         return []
 

@@ -53,6 +53,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一个数据查询助手。你可以调用以
 3. get_table_schema(table_name) —— 获取单表完整列信息（列名+业务含义）
 4. get_metric_caliber(hint) —— 获取指标口径（计算表达式、时间字段、过滤条件）
 5. execute_sql(sql) —— 执行 SELECT 查询
+6. read_result(result_id) —— 按 ID 读取历史查询结果的完整内容（历史结果以索引形式提供，需要完整数据时调用）
 
 当前日期信息（时区 Asia/Shanghai）：
 - 今天是 {today}；昨天是 {yesterday}；明天是 {tomorrow}
@@ -68,6 +69,9 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一个数据查询助手。你可以调用以
 5. execute_sql 返回以 ❌ 开头的错误时：调 get_table_schema 核对列名后重写，
    不要重复同样的错误 SQL；重试 2 次仍失败就基于已有信息回答
 6. 不要重复调用目的与参数完全相同的工具；已拿到所需信息就直接进入下一步
+7. 历史查询结果以索引列表形式提供（含 ID、SQL 摘要、行数、预览）。
+   追问历史数据时，先看索引找到对应 result_id，再调 read_result(result_id=ID)
+   拉取完整结果，不要重新执行同样的 SQL
 
 你必须严格按以下 JSON 格式回复（不要加任何其他文字、不要用 markdown 代码块）：
 - 想调工具时：{{"thought": "你的思考", "tool": "工具名", "args": {{"参数名": "参数值"}}}}
@@ -103,7 +107,8 @@ def system_prompt_tokens() -> int:
     return estimate_tokens(_build_system_prompt())
 
 # 最终回答阶段的 system prompt：纯总结，不要 JSON、不要思考过程
-# L25 证据约束：事实与推测分开，趋势/原因类结论必须有计算或数据支撑
+# L24 证据约束：事实与推测分开，趋势/原因类结论必须有计算或数据支撑
+# L25 数值格式化：金额/比率/百分比统一小数位，避免 15 位小数
 FINAL_SYSTEM_PROMPT = (
     "你是数据查询助手。根据已有的数据与计算结果，用简洁清晰的语言回答用户。\n"
     "严格遵守：\n"
@@ -111,7 +116,9 @@ FINAL_SYSTEM_PROMPT = (
     "2. 增长、下降、反超、趋势等判断，必须有对应计算支撑（等长前期对比、同比、"
     "按月序列等）；没有计算就明确写“需补充数据验证”，不得直接断言\n"
     "3. 原因解释（促销、旺季、活动等）必须有事件数据支持，否则标注为推测或不写\n"
-    "4. 回答中事实、推测、建议分开呈现。直接输出回答，不要思考过程。"
+    "4. 回答中事实、推测、建议分开呈现。直接输出回答，不要思考过程。\n"
+    "5. 数值格式化：金额保留 2 位小数，百分比保留 1-2 位小数，"
+    "客单价/比率保留 2 位小数；不要输出超过 4 位的小数。"
 )
 
 
@@ -203,11 +210,10 @@ def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
     chain = _tool_chain(messages)
     if chain:
         parts.append(chain)
-    hist_tools = [tool_result_view(m["content"], KIND_RESULT)
-                  for m in (history or []) if m["role"] == "tool"]
+    # L27：历史中的 tool 消息是合并的结果索引列表（一条），直接展示文本
+    hist_tools = [m["content"] for m in (history or []) if m["role"] == "tool"]
     if hist_tools:
-        parts.append("历史查询过的事实结果：\n"
-                     + "\n".join(f"- {c}" for c in hist_tools))
+        parts.append("历史查询结果索引：\n" + "\n".join(hist_tools))
 
     user_content = f"用户问题：{user_msg}"
     if parts:
@@ -236,22 +242,31 @@ def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
 
 
 def chat_stream_final(user_message: str, tool_output: str,
-                      history: list[dict] | None = None):
+                      history: list[dict] | None = None,
+                      sql_evidence: list[tuple[str, str]] | None = None):
     """
     回答阶段（流式）：逐字生成最终回答，供前端实时渲染。
     不用 JSON 协议，直接生成自然语言。
 
     L22 P1-1：当前轮工具结果 + 历史投影里的工具事实都要带上——
     追问（本轮无工具调用）时，模型仍能看到上一轮的具体数字。
+
+    L25：sql_evidence 是本轮成功执行的 [(sql, result_text), ...]，
+    优先于 tool_output（结构化依据包含 SQL + 结果，解决"查过却无法确认口径"）。
+    纯追问场景（无工具调用）时 sql_evidence 为空，回退到 tool_output。
     """
     parts = []
-    if tool_output:
+    if sql_evidence:
+        lines = [f"SQL: {sql}\n结果: {result}"
+                 for sql, result in sql_evidence]
+        parts.append("本轮查询依据（实际执行的 SQL 与结果）：\n"
+                     + "\n\n".join(lines))
+    elif tool_output:
         parts.append(f"工具返回结果：\n{tool_output}")
-    hist_tools = [tool_result_view(m["content"], KIND_RESULT)
-                  for m in (history or []) if m["role"] == "tool"]
+    # L27：历史中的 tool 消息是合并的结果索引列表，直接展示
+    hist_tools = [m["content"] for m in (history or []) if m["role"] == "tool"]
     if hist_tools:
-        parts.append("历史查询过的事实结果：\n"
-                     + "\n".join(f"- {c}" for c in hist_tools))
+        parts.append("历史查询结果索引：\n" + "\n".join(hist_tools))
 
     body = f"{_history_text(history)}用户问题：{user_message}\n\n"
     if parts:

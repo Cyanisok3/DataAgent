@@ -127,6 +127,19 @@ def load_messages(session_id: str) -> list[dict]:
             for r in rows]
 
 
+def load_result_by_id(session_id: str, result_id: int) -> str | None:
+    """按 message_id 拉取历史查询结果的完整内容（L27 read_result 工具用）。
+    只返回 kind=result 的消息（防止读取对话/摘要/错误结果）。"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT content FROM messages "
+        "WHERE id = ? AND session_id = ? AND role = 'tool' AND kind = 'result'",
+        (result_id, session_id),
+    ).fetchone()
+    conn.close()
+    return row["content"] if row else None
+
+
 # ─── 写账本层 ───────────────────────────────────────────────
 
 def apply_summary(session_id: str, segment: list[dict], summary_text: str):

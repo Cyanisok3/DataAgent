@@ -16,7 +16,7 @@ import context as C
 # ─── 辅助：构造一条消息 ────────────────────────────────────
 
 def _msg(role, content, **kw):
-    m = {"role": role, "content": content}
+    m = {"role": role, "content": content, "id": 0}
     m.update(kw)
     return m
 
@@ -29,12 +29,12 @@ def _assistant(content, turn=1):
     return _msg("assistant", content, kind=C.KIND_CHAT, turn=turn)
 
 
-def _tool_result(content, turn=1):
-    return _msg("tool", content, kind=C.KIND_RESULT, turn=turn)
+def _tool_result(content, turn=1, **kw):
+    return _msg("tool", content, kind=C.KIND_RESULT, turn=turn, **kw)
 
 
-def _tool_context(content, turn=1):
-    return _msg("tool", content, kind=C.KIND_CONTEXT, turn=turn)
+def _tool_context(content, turn=1, **kw):
+    return _msg("tool", content, kind=C.KIND_CONTEXT, turn=turn, **kw)
 
 
 # ─── 1. estimate_tokens ────────────────────────────────────
@@ -127,15 +127,20 @@ class TestProjectHistory:
         tool_contents = [m["content"] for m in view if m["role"] == "tool"]
         assert all("表结构" not in c for c in tool_contents)
 
-    def test_max_tool_results_cap(self):
-        """事实性结果最多投影 MAX_TOOL_RESULTS 条（全局最后 N 条）。"""
+    def test_result_index_cap(self):
+        """L27：结果索引最多保留 RESULT_INDEX_MAX 条（替代旧的 MAX_TOOL_RESULTS）。"""
         history = [_user("q", turn=1)]
-        for i in range(C.MAX_TOOL_RESULTS + 3):
-            history.append(_tool_result(f"结果{i}", turn=1))
+        for i in range(C.RESULT_INDEX_MAX + 5):
+            history.append(_tool_result(f"结果{i}", turn=1, id=i + 1))
         history.append(_assistant("a", turn=1))
         view = C.project_history(history)
-        tool_count = sum(1 for m in view if m["role"] == "tool")
-        assert tool_count == C.MAX_TOOL_RESULTS
+        # tool 消息只有一条（合并的索引列表）
+        tool_msgs = [m for m in view if m["role"] == "tool"]
+        assert len(tool_msgs) == 1
+        index_text = tool_msgs[0]["content"]
+        # 索引中应包含最后 RESULT_INDEX_MAX 条，不包含最早的 5 条
+        assert "结果0" not in index_text  # 最早的被挤出索引
+        assert f"结果{C.RESULT_INDEX_MAX + 4}" in index_text  # 最新的在索引中
 
     def test_summary_prepended(self):
         """有效摘要前置，且不可丢。"""
@@ -185,21 +190,16 @@ class TestBudgetConsistency:
     修复后两者必须同口径。
     """
 
-    def test_round_cost_matches_projected_facts(self):
-        """一轮有 10 条事实结果，但只投影最后 4 条；
-        _round_cost 必须只算这 4 条，而非 10 条。"""
+    def test_round_cost_dialogue_only(self):
+        """L27：_round_cost 只算对话，事实结果不占实时投影预算
+        （事实以索引形式合并为一条消息，成本固定且很小）。"""
         turn = 1
         round_msgs = [_user("q", turn=turn), _assistant("a", turn=turn)]
-        facts = [_tool_result(f"r{i}", turn=turn) for i in range(10)]
-        factual_by_turn = {turn: facts}
 
-        cost = C._round_cost(round_msgs, factual_by_turn)
+        cost = C._round_cost(round_msgs)
 
-        # 手动算同口径：对话 + 最后 4 条事实的视图
+        # 只算对话的 token
         expected = sum(C.estimate_tokens(C._dialogue_view(m)) for m in round_msgs)
-        for m in facts[-C.MAX_TOOL_RESULTS:]:
-            expected += C.estimate_tokens(
-                C.tool_result_view(m["content"], C.KIND_RESULT))
         assert cost == expected
 
     def test_find_compressible_matches_project_history_dropped(self):
@@ -213,7 +213,7 @@ class TestBudgetConsistency:
 
         # 直接比较：project_history 保留的 turn 集合 vs find_compressible 涉及的 turn
         summaries, rounds, factual, budget = C._budget_split(history)
-        kept, dropped = C._fit_rounds(rounds, factual, budget)
+        kept, dropped = C._fit_rounds(rounds, budget)
         kept_turns = {r[0]["turn"] for r in kept}
         dropped_turns = {r[0]["turn"] for r in dropped}
 
@@ -235,21 +235,36 @@ class TestBudgetConsistency:
         assert C.find_compressible(history) == []
 
 
-# ─── 6. 事实按轮绑定 ──────────────────────────────────────
+class TestResultIndex:
+    """L27：结果索引替代"按轮绑定的完整结果投影"。"""
 
-class TestFactTurnBinding:
-    def test_facts_only_from_kept_turns(self):
-        """投影的事实必须来自被保留的轮次，不能跨轮混入。"""
+    def test_index_includes_all_turns(self):
+        """结果索引包含所有轮次的 kind=result（不再按保留轮绑定）。"""
         history = [
             _user("旧问题", turn=1),
-            _tool_result("旧事实", turn=1),
+            _tool_result("旧事实", turn=1, id=1),
             _assistant("旧回答", turn=1),
             _user("新问题", turn=2),
-            _tool_result("新事实", turn=2),
+            _tool_result("新事实", turn=2, id=2),
             _assistant("新回答", turn=2),
         ]
         view = C.project_history(history)
-        tool_contents = [m["content"] for m in view if m["role"] == "tool"]
-        # 两轮都短，都应保留；事实应包含两轮
-        assert "新事实" in tool_contents
-        assert "旧事实" in tool_contents
+        tool_msgs = [m for m in view if m["role"] == "tool"]
+        assert len(tool_msgs) == 1  # 合并为一条索引消息
+        index_text = tool_msgs[0]["content"]
+        assert "旧事实" in index_text
+        assert "新事实" in index_text
+
+    def test_index_excludes_context_and_error(self):
+        """索引只包含 kind=result，排除 context 和 error。"""
+        history = [
+            _user("q", turn=1),
+            _tool_context("表结构", turn=1, id=1),
+            _tool_result("正确结果", turn=1, id=2),
+            _msg("tool", "错误结果", kind=C.KIND_ERROR, turn=1, id=3),
+            _assistant("a", turn=1),
+        ]
+        index = C.build_result_index(history)
+        assert "正确结果" in index
+        assert "表结构" not in index
+        assert "错误结果" not in index

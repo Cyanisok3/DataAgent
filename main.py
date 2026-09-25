@@ -27,6 +27,7 @@ from context import (
     CONTEXT_TOOLS,
     KIND_CONTEXT,
     KIND_RESULT,
+    KIND_ERROR,
 )
 from session_store import (
     init_db, save_message, load_messages, next_turn, usage_stats,
@@ -67,26 +68,45 @@ def _session_pipeline(session_id: str, message: str):
       落库顺序：user → tool（按 kind 声明）→ assistant（流式拼接）
       压缩：事件流结束前启动后台 daemon 线程（SSE 立即关闭，L22 P2-2）
     """
-    projected = project_history(load_messages(session_id))
+    full_history = load_messages(session_id)
+    projected = project_history(full_history)
     turn = next_turn(session_id)
     save_message(session_id, "user", message, turn=turn)
 
     final_answer = ""
-    for event in run_react_stream(message, projected):
+    for event in run_react_stream(message, projected, full_history):
         if event["type"] == "text_chunk":
             final_answer += event["content"]
         elif event["type"] == "tool_result":
-            # 工具结果落库（kind 在写入时声明，按工具名集合判定）：
-            #   schema/口径/表清单 = 引导性（context），消费完即弃
-            #   execute_sql 结果 = 事实性（result），可被追问引用
-            kind = (KIND_CONTEXT if event["name"] in CONTEXT_TOOLS
-                    else KIND_RESULT)
-            # header 记录工具名+参数（L25 审计修复：旧日志看不到调用参数）
-            header = f"[{event['name']}({json.dumps(event.get('input', {}), ensure_ascii=False)})]"
+            # kind 判定（L26）：
+            #   执行失败 → error（留档审计，不占历史事实名额）
+            #   schema/口径/表清单 → context（引导性，消费完即弃）
+            #   execute_sql 成功 → result（事实性，可被追问引用）
+            if event.get("is_error"):
+                kind = KIND_ERROR
+            elif event["name"] in CONTEXT_TOOLS:
+                kind = KIND_CONTEXT
+            else:
+                kind = KIND_RESULT
+            # header：工具名+参数；对 execute_sql 附加护栏改写后实际执行的 SQL
+            header = f"[{event['name']}({json.dumps(event.get('input', {}), ensure_ascii=False)})"
+            if event.get("sql"):
+                header += f" → SQL: {event['sql']}"
+            header += "]"
             save_message(session_id, "tool", f"{header}\n{event['output']}",
                          kind, turn=turn)
+            # 控制台可观测性日志（L26）：编号+耗时+工具名+实际SQL
+            print(f"[工具#{event.get('invocation', '?')} "
+                  f"{event['name']} {event.get('elapsed_ms', '?')}ms"
+                  f"{' ERROR' if event.get('is_error') else ''}] "
+                  f"{event.get('sql') or event.get('input', '')}")
         elif event["type"] == "text":          # max_iters 兜底分支
             final_answer = event["content"]
+        elif event["type"] == "done":
+            # 轮次终态日志（不进 trace，不进 SSE 之外的存储）
+            print(f"[轮次结束] status={event['status']} "
+                  f"invocations={event.get('invocations', 0)} "
+                  f"session={session_id}")
         yield event
 
     if final_answer:
@@ -112,7 +132,7 @@ def chat(req: ChatRequest):
             answer += event["content"]
         elif event["type"] == "text":
             answer = event["content"]
-        if event["type"] != "text_chunk":
+        if event["type"] not in ("text_chunk", "done"):
             trace.append(event)
     return {"answer": answer, "trace": trace}
 

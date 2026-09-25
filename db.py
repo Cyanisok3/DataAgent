@@ -159,26 +159,30 @@ def _load_csv(conn, filename, table, columns, **casts):
                      cleaned)
 
 
-def execute_query(sql: str) -> str:
-    """执行 SELECT SQL，返回结果文本"""
+def execute_query(sql: str) -> dict:
+    """执行 SELECT SQL，返回结构化结果（L25：供 ToolResult 组装执行依据）。
+    返回 {"content": str, "columns": list, "row_count": int, "truncated": bool}。
+    content 是给模型看的可读文本（前 20 行）；row_count 是实际匹配行数。"""
     with engine.connect() as conn:
         result = conn.execute(text(sql))
 
-        # 列名
         columns = list(result.keys())
         rows = result.fetchall()
+        row_count = len(rows)
 
         if not rows:
-            return "查询结果为空。"
+            return {"content": "查询结果为空。", "columns": columns,
+                    "row_count": 0, "truncated": False}
 
-        # 格式化成文本
-        lines = [f"Columns: {columns}", f"Total rows: {len(rows)}"]
-        for row in rows[:20]:  # 最多显示 20 行
+        lines = [f"Columns: {columns}", f"Total rows: {row_count}"]
+        for row in rows[:20]:
             lines.append(str(dict(row._mapping)))
-        if len(rows) > 20:
-            lines.append(f"（已截断，仅显示前 20 行，共 {len(rows)} 行）")
+        truncated = row_count > 20
+        if truncated:
+            lines.append(f"（已截断，仅显示前 20 行，共 {row_count} 行）")
 
-        return "\n".join(lines)
+        return {"content": "\n".join(lines), "columns": columns,
+                "row_count": row_count, "truncated": truncated}
 
 
 # 自测
@@ -203,9 +207,9 @@ if __name__ == "__main__":
         "SELECT s.name, ROUND(SUM(o.order_total), 2) AS total "
         "FROM orders o JOIN stores s ON o.store_id = s.id "
         "GROUP BY s.name ORDER BY total DESC"
-    ))
+    )["content"])
     print("\n=== 测试：最近 30 天订单量 ===")
     print(execute_query(
         "SELECT COUNT(*) AS cnt FROM orders "
         "WHERE ordered_at >= DATE('now', '-30 day')"
-    ))
+    )["content"])
