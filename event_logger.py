@@ -1,52 +1,84 @@
-"""
-event_logger.py —— 事件→落库映射（L29 从 main.py 抽出）
+"""模型调用日志：完整请求与部分响应可重建，usage 缺失明确为 null。"""
 
-职责：把 ReAct 事件流中的 tool_result 事件翻译成 sessions.db 的一行记录。
-main.py 只负责 HTTP 层和事件流编排，落库细节在这里。
-
-依赖方向：event_logger → session_store + context（无反向依赖）。
-"""
 import json
+from dataclasses import asdict
 
-from context import CONTEXT_TOOLS, KIND_CONTEXT, KIND_ERROR, KIND_RESULT
-from session_store import save_message
-
-
-def log_tool_result(event: dict, session_id: str, turn: int) -> None:
-    """
-    把一个 tool_result 事件落库到 messages 表。
-
-    kind 判定：
-      执行失败       → KIND_ERROR（留档审计，不占历史事实名额）
-      schema/口径/表清单 → KIND_CONTEXT（引导性，消费完即弃）
-      execute_sql 成功 → KIND_RESULT（事实性，可被追问引用 / read_result）
-
-    header：工具名+参数；对 execute_sql 附加护栏改写后实际执行的 SQL，
-    区分"模型提交的 SQL"与"实际执行的 SQL"。
-    full_output：完整查询结果（L29 工具结果完整留档），优先于 output 落库，
-    保证 read_result 能拿到完整数据而非前 20 行截断版。
-    """
-    if event.get("is_error"):
-        kind = KIND_ERROR
-    elif event["name"] in CONTEXT_TOOLS:
-        kind = KIND_CONTEXT
-    else:
-        kind = KIND_RESULT
-
-    header = f"[{event['name']}({json.dumps(event.get('input', {}), ensure_ascii=False)})"
-    if event.get("sql"):
-        header += f" → SQL: {event['sql']}"
-    header += "]"
-
-    # L29：优先落完整结果（full_output），保证 read_result 有效；
-    # 没有 full_output 时退回 output（前 20 行展示版）
-    body = event.get("full_output") or event["output"]
-    save_message(session_id, "tool", f"{header}\n{body}", kind, turn=turn)
+from context import serialize
+from run_context import CURRENT_RUN
+from session_store import connection
 
 
-def log_invocation(event: dict) -> None:
-    """控制台可观测性日志：工具调用编号+耗时+工具名+实际SQL。"""
-    print(f"[工具#{event.get('invocation', '?')} "
-          f"{event['name']} {event.get('elapsed_ms', '?')}ms"
-          f"{' ERROR' if event.get('is_error') else ''}] "
-          f"{event.get('sql') or event.get('input', '')}")
+def start_call(phase, view, config):
+    run = CURRENT_RUN.get()
+    if not run or not run.session_id:
+        return None
+    with connection() as conn:
+        return conn.execute(
+            """INSERT INTO model_calls
+            (session_id,turn,phase,request,config,view,status) VALUES (?,?,?,?,?,?,'running')""",
+            (
+                run.session_id,
+                run.turn,
+                phase,
+                serialize(view.messages),
+                serialize(config),
+                serialize(asdict(view)),
+            ),
+        ).lastrowid
+
+
+def finish_call(call_id, response, usage, status, elapsed_ms, error=None):
+    if call_id is None:
+        return
+    with connection() as conn:
+        conn.execute(
+            """UPDATE model_calls SET response=?,usage=?,status=?,elapsed_ms=?,error=?
+            WHERE id=? AND status='running'""",
+            (response, serialize(usage), status, elapsed_ms, error, call_id),
+        )
+
+
+def usage_stats(sid):
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM model_calls WHERE session_id=? ORDER BY id", (sid,)
+        ).fetchall()
+        compressed = conn.execute(
+            """SELECT COUNT(*) FROM messages WHERE session_id=?
+            AND is_summary=1 AND source_ids IS NOT NULL AND replaced_by IS NULL""",
+            (sid,),
+        ).fetchone()[0]
+    if not rows:
+        return {
+            "session_id": sid,
+            "last_llm_call": None,
+            "compressed": bool(compressed),
+        }
+    latest = dict(rows[-1])
+    view = json.loads(latest["view"])
+    usage = json.loads(latest["usage"]) if latest["usage"] else None
+    round_calls = [dict(r) for r in rows if r["turn"] == latest["turn"]]
+    available = [
+        json.loads(r["usage"]) for r in round_calls if r["usage"] not in (None, "null")
+    ]
+    return {
+        "session_id": sid,
+        "unit": "estimated_tokens",
+        "projected_tokens": view["estimated_tokens"],
+        "serialized_bytes": view["serialized_bytes"],
+        "omitted": view["omitted"],
+        "compressed": bool(compressed),
+        "last_llm_call": {
+            "phase": latest["phase"],
+            "model": json.loads(latest["config"])["model"],
+            "status": latest["status"],
+            "usage": usage,
+        },
+        "round_usage": {
+            k: sum(u.get(k, 0) for u in available) if available else None
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+        },
+        "missing_usage_phases": [
+            r["phase"] for r in round_calls if r["usage"] in (None, "null")
+        ],
+    }

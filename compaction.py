@@ -1,86 +1,124 @@
-"""
-compaction.py —— 压缩编排（L24 从 main.py 移出的胶水层）
+"""在会话锁内按需压缩：模型选片段，代码保留原文与来源，不自由改写数字。"""
 
-职责：把"什么时候压缩"串成一条完整动作——
-  per-session 锁（并发安全）→ 同口径判定（find_compressible）→
-  LLM 摘要（summarize_history）→ 保真验证（_verify_summary）→
-  落账本（apply_summary）
-
-main.py 只调一行：threading.Thread(target=maybe_compress, ...)。
-本文件依赖 session_store / context / llm，不被它们反向依赖（无环）。
-
-L29：摘要保真验证——原始 segment 有关键数字但摘要完全无数字时拒绝提交，
-防止压缩后丢失事实（审计文档 P2：摘要非空就替换，没有验证数字保真）。
-"""
+import hashlib
+import json
 import re
-import threading
 
-from context import find_compressible
-from session_store import load_messages, apply_summary
-from llm import summarize_history
+from pydantic import BaseModel, ConfigDict
 
-# per-session 压缩锁——同会话压缩串行化，跨会话并行。
-# 锁字典本身也要一把锁保护（多线程并发 setdefault 可能丢条目）。
-_compress_locks: dict[str, threading.Lock] = {}
-_compress_locks_guard = threading.Lock()
+from context import estimate_tokens, serialize, visible_history
+from llm import WATERMARK_TOKENS, decision_view, summarize_history
+from run_context import RunCancelled
+from session_store import apply_summary, load_messages, save_event
 
 
-def _verify_summary(summary: str, segment: list[dict]) -> bool:
-    """摘要保真验证（L29）：原始 segment 有关键数字但摘要完全无数字时拒绝。
-
-    审计文档问题：摘要非空就替换，可能丢失今年销售额等关键数字。
-    验证逻辑：
-      1. 提取原始 segment 中的所有数字（含小数）
-      2. 提取摘要中的所有数字
-      3. 原始有数字但摘要完全无数字 → 拒绝（明显丢了事实）
-      4. 数字覆盖率低于 10% → 警告但不拒绝（摘要本来就是压缩）
-
-    返回 True 表示通过验证可以提交，False 表示拒绝。
-    """
-    original_text = " ".join(m.get("content", "") for m in segment)
-    original_numbers = set(re.findall(r'\d+\.?\d*', original_text))
-    summary_numbers = set(re.findall(r'\d+\.?\d*', summary))
-
-    # 原始 segment 无数字（纯对话），不验证数字
-    if not original_numbers:
-        return True
-
-    # 原始有数字但摘要完全无数字 → 拒绝
-    if not summary_numbers:
-        print(f"[compress] 摘要验证失败：原始有 {len(original_numbers)} 个数字，"
-              f"摘要中无数字，拒绝提交")
-        return False
-
-    # 数字覆盖率警告（不拒绝）
-    coverage = len(original_numbers & summary_numbers) / len(original_numbers)
-    if coverage < 0.1:
-        print(f"[compress] 摘要警告：数字覆盖率仅 {coverage:.1%}，"
-              f"可能丢失关键事实（原始 {len(original_numbers)} 个数字，"
-              f"摘要保留 {len(summary_numbers)} 个）")
-    return True
+class Selection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    keep: list[int]
 
 
-def maybe_compress(session_id: str):
-    """压缩：找装不下的旧段 → LLM 摘要 → 保真验证 → 落账本。
-    投影按 WATERMARK_TOKENS 预算从新往回装；find_compressible 返回
-    投影装不下的旧段——这就是"该压缩什么"的判定（同口径）。
-    deepseek-flash 窗口 1M token，正常会话不会走到这里；
-    罕见路径也必须正确，异常显式打印、不静默吞掉。"""
-    with _compress_locks_guard:
-        lock = _compress_locks.setdefault(session_id, threading.Lock())
-    with lock:
-        try:
-            history = load_messages(session_id)
-            segment = find_compressible(history)
-            if len(segment) < 2:
-                return   # 预算装得下全部对话：没有值得压缩的旧段
-            summary = summarize_history(segment, session_id=session_id)
-            if not summary:
-                return
-            # L29：保真验证——数字完全丢失时拒绝提交
-            if not _verify_summary(summary, segment):
-                print(f"[compress] session={session_id} 摘要未通过保真验证，跳过压缩")
-                return
-            apply_summary(session_id, segment, summary)
-        except Exception as e:
-            print(f"[compress] session={session_id} 压缩失败: {e}")
+def paragraphs_for(segment):
+    paragraphs: list[dict] = []
+    for m in segment:
+        # 用户修正/确认、旧验证摘要作为不可分割的原文；不让摘要猜任务状态。
+        parts = (
+            [m["content"]]
+            if m["role"] == "user" or m.get("is_summary")
+            else m["content"].split("\n\n")
+        )
+        paragraphs.extend(
+            {
+                "source_id": m["id"],
+                "role": m["role"],
+                "text": text,
+                "mandatory": m["role"] == "user"
+                or bool(m.get("is_summary"))
+                or bool(re.search(r"\d", text)),
+            }
+            for text in parts
+            if text.strip()
+        )
+    return paragraphs
+
+
+def validate_summary(raw: str, paragraphs: list[dict]) -> str:
+    keep = Selection.model_validate(json.loads(raw)).keep
+    if len(keep) != len(set(keep)) or any(i < 0 or i >= len(paragraphs) for i in keep):
+        raise ValueError("invalid_summary_selection")
+    required = {i for i, p in enumerate(paragraphs) if p["mandatory"]}
+    # 数字与用户原文由代码强制保留，模型无权删除或互换其归属。
+    selected = sorted(set(keep) | required)
+    summary = "[已结束历史摘录，不是当前待办]\n" + serialize(
+        [
+            {k: p[k] for k in ("source_id", "role", "text")}
+            for i, p in enumerate(paragraphs)
+            if i in selected
+        ]
+    )
+    if not selected:
+        raise ValueError("empty_summary")
+    if estimate_tokens(summary) > WATERMARK_TOKENS:
+        raise ValueError("summary_over_budget")
+    return summary
+
+
+def maybe_compress(sid, turn, question, results):
+    history = load_messages(sid)
+    view = decision_view([{"role": "user", "content": question}], history, results)
+    if not view.omitted:
+        return
+    visible = visible_history(history)
+    latest = max((m["turn"] for m in visible), default=0)
+    segment = [m for m in visible if m["turn"] < latest and not m.get("protected")]
+    if len(segment) < 2:
+        return
+    source = serialize(segment)
+    audit = {
+        "type": "compaction",
+        "source_ids": [m["id"] for m in segment],
+        "source_version": hashlib.sha256(source.encode()).hexdigest(),
+        "before_bytes": len(source.encode()),
+        "status": "rejected",
+        "raw": None,
+    }
+    try:
+        paragraphs = paragraphs_for(segment)
+        raw = summarize_history(paragraphs)
+        audit["raw"] = raw
+        summary = validate_summary(raw, paragraphs)
+        before = serialize(
+            [{"role": m["role"], "content": m["content"]} for m in segment]
+        )
+        after = serialize([{"role": "assistant", "content": summary}])
+        audit.update(before_bytes=len(before.encode()), after_bytes=len(after.encode()))
+        if len(after.encode()) >= len(before.encode()):
+            raise ValueError("summary_no_gain")
+        source_ids = {m["id"] for m in segment}
+        candidate = [m for m in history if m["id"] not in source_ids]
+        candidate.append(
+            {
+                "id": -1,
+                "role": "assistant",
+                "content": summary,
+                "is_summary": 1,
+                "source_ids": sorted(source_ids),
+                "turn": min(m["turn"] for m in segment),
+                "logical_position": min(
+                    m.get("logical_position") or m["id"] for m in segment
+                ),
+            }
+        )
+        candidate_view = decision_view([{"role": "user", "content": question}], candidate, results)
+        audit.update(before_request_tokens=view.estimated_tokens,
+                     after_request_tokens=candidate_view.estimated_tokens)
+        if candidate_view.estimated_tokens >= view.estimated_tokens:
+            raise ValueError("request_no_gain")
+        apply_summary(sid, segment, summary)
+        audit["status"] = "committed"
+    except RunCancelled:
+        audit.update(status="cancelled", reason="client_disconnected")
+        raise
+    except Exception as exc:  # noqa: BLE001 — 一次尝试，退回有记录的整轮省略
+        audit["reason"] = str(exc)
+    finally:
+        save_event(sid, turn, audit)

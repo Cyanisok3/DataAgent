@@ -215,20 +215,22 @@ METRICS = {
 
 # ─── 反向匹配算法 ────────────────────────────────────────────
 
-def match_domains(question: str) -> list[Domain]:
+def match_domains(question: str, domains: list[Domain] | None = None) -> list[Domain]:
     """
     反向匹配：用户问题 → 哪些域相关？
     做法：问题里命中任一域关键词即算相关。
     """
+    catalog = DOMAINS if domains is None else domains
     hits = []
-    for d in DOMAINS:
+    for d in catalog:
         if any(kw in question for kw in d.keywords):
             hits.append(d)
-    return hits if hits else DOMAINS  # 没命中就返回全部（兜底）
+    return hits if hits else catalog
 
 
 def match_tables(question: str, domains: list[Domain],
-                 metrics: list[Metric] | None = None) -> list[Table]:
+                 metrics: list[Metric] | None = None,
+                 tables: list[Table] | None = None) -> list[Table]:
     """
     反向匹配：用户问题 + 域 + 指标 → 哪些表相关？
     两种来源合并：
@@ -236,9 +238,10 @@ def match_tables(question: str, domains: list[Domain],
       2. 指标依赖的表（"销售额"命中 sales → 必须带出 orders）
     门禁：is_visible 必须为 True。
     """
+    catalog = TABLES if tables is None else tables
     domain_keys = {d.key for d in domains}
     keyword_hits = []
-    for t in TABLES:
+    for t in catalog:
         if not t.is_visible:
             continue  # 门禁 1：不可见的表直接跳过
         if t.domain_key not in domain_keys:
@@ -252,24 +255,25 @@ def match_tables(question: str, domains: list[Domain],
     for m in (metrics or []):
         needed = [m.table, *m.related_tables]
         for name in needed:
-            for t in TABLES:
+            for t in catalog:
                 if t.name == name and t.is_visible and t not in metric_tables:
                     metric_tables.append(t)
 
     merged = keyword_hits + [t for t in metric_tables if t not in keyword_hits]
     # 兜底：一个都没命中 → 返回域内全部可见表
-    return merged if merged else [t for t in TABLES
+    return merged if merged else [t for t in catalog
                                   if t.is_visible and t.domain_key in domain_keys]
 
 
-def match_metrics(question: str, tables: list[Table] | None = None) -> list[Metric]:
+def match_metrics(question: str, tables: list[Table] | None = None,
+                  metrics: dict[str, Metric] | None = None) -> list[Metric]:
     """
     反向匹配：用户问题 → 哪些指标相关？
     全范围匹配（不看表），命中就带出对应表；没命中返回空，
     让表关键词命中来兜底（避免"客单价"这种反直觉匹配落空）。
     """
     hits = []
-    for m in METRICS.values():
+    for m in (METRICS if metrics is None else metrics).values():
         all_keywords = [m.name] + m.aliases
         if any(kw in question for kw in all_keywords):
             hits.append(m)

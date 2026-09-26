@@ -14,10 +14,19 @@ dbt-labs/jaffle-shop，CC 许可教学数据）。真实数据：
 对应原版的 DataSource + SqlExecutor。要上 MySQL 只改 DB_URL 一行。
 """
 import csv
+import json
 import os
+import sqlite3
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote
 
 from sqlalchemy import create_engine, text
+
+from datasource import CURRENT_SOURCE
+from run_context import CURRENT_RUN
+from sql_guard import MAX_ROWS
 
 # SQLite 数据库文件
 DB_URL = "sqlite:///business.db"
@@ -92,7 +101,7 @@ def init_db():
         """))
         conn.commit()
 
-        if conn.execute(text("SELECT COUNT(*) FROM orders")).scalar() > 0:
+        if (conn.execute(text("SELECT COUNT(*) FROM orders")).scalar() or 0) > 0:
             return  # 已有数据，跳过导入（幂等）
 
         shift = _shift_days()
@@ -159,67 +168,66 @@ def _load_csv(conn, filename, table, columns, **casts):
                      cleaned)
 
 
-def execute_query(sql: str) -> dict:
-    """执行 SELECT SQL，返回结构化结果（L25 + L29）。
-    返回 {"content": str, "full_content": str, "columns": list,
-           "row_count": int, "truncated": bool}。
-    content      = 前 20 行（给模型决策和前端展示，控制 token）
-    full_content = 完整结果（落库用，保证 read_result 能拿到全部数据）
-    row_count    = 实际匹配行数；sql_guard 已加 LIMIT 200，完整结果可控。"""
-    with engine.connect() as conn:
-        result = conn.execute(text(sql))
-
-        columns = list(result.keys())
-        rows = result.fetchall()
-        row_count = len(rows)
-
-        if not rows:
-            return {"content": "查询结果为空。", "full_content": "查询结果为空。",
-                    "columns": columns, "row_count": 0, "truncated": False}
-
-        # 完整结果（落库用）：sql_guard LIMIT 200，最多 200 行
-        full_lines = [f"Columns: {columns}", f"Total rows: {row_count}"]
-        for row in rows:
-            full_lines.append(str(dict(row._mapping)))
-        full_content = "\n".join(full_lines)
-
-        # 展示版（前 20 行）：给模型决策和前端展示，控制 token
-        lines = [f"Columns: {columns}", f"Total rows: {row_count}"]
-        for row in rows[:20]:
-            lines.append(str(dict(row._mapping)))
-        truncated = row_count > 20
-        if truncated:
-            lines.append(f"（已截断，仅显示前 20 行，共 {row_count} 行）")
-
-        return {"content": "\n".join(lines), "full_content": full_content,
-                "columns": columns, "row_count": row_count, "truncated": truncated}
+MAX_RESULT_BYTES = 1_000_000
+MAX_CELL_BYTES = 64_000
+BUSINESS_PATH = Path(__file__).with_name("business.db")
 
 
-# 自测
-if __name__ == "__main__":
-    import os
-    if os.path.exists("business.db"):
-        os.remove("business.db")
+def execute_query(sql: str, *, path: str | Path | None = None, timeout: float = 5) -> dict:
+    """只读、有时限、有界读取。返回行数不是全库匹配行数。"""
+    target = Path(path or CURRENT_SOURCE.get().path).resolve()
+    uri = "file:" + quote(str(target), safe="/") + "?mode=ro"
+    query_engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(uri, uri=True))
+    deadline = time.monotonic() + timeout
+    run = CURRENT_RUN.get()
 
-    init_db()
-    print("=== 数据概览 ===")
-    for tbl in ("customers", "orders", "items", "products", "stores", "supplies"):
-        with engine.connect() as conn:
-            print(f"{tbl}: {conn.execute(text(f'SELECT COUNT(*) FROM {tbl}')).scalar()} 行")
+    def interrupted():
+        return time.monotonic() >= deadline or bool(run and (
+            run.cancel.is_set() or time.monotonic() >= run.deadline))
 
-    print("\n=== 时间范围（已平移）===")
-    with engine.connect() as conn:
-        r = conn.execute(text("SELECT MIN(ordered_at), MAX(ordered_at) FROM orders")).fetchone()
-        print(f"{r[0]} ~ {r[1]}")
-
-    print("\n=== 测试：各门店销售额（美元）===")
-    print(execute_query(
-        "SELECT s.name, ROUND(SUM(o.order_total), 2) AS total "
-        "FROM orders o JOIN stores s ON o.store_id = s.id "
-        "GROUP BY s.name ORDER BY total DESC"
-    )["content"])
-    print("\n=== 测试：最近 30 天订单量 ===")
-    print(execute_query(
-        "SELECT COUNT(*) AS cnt FROM orders "
-        "WHERE ordered_at >= DATE('now', '-30 day')"
-    )["content"])
+    try:
+        if run:
+            run.check()
+        with query_engine.connect() as conn:
+            driver = conn.connection.driver_connection
+            assert driver is not None
+            driver.execute("PRAGMA query_only = ON")
+            driver.set_progress_handler(lambda: int(interrupted()), 100)
+            # 限制 SQLite 本身的分配，不等到巨型字符串已经进入 Python 才拒绝。
+            if hasattr(driver, "setlimit"):
+                driver.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_RESULT_BYTES)
+            try:
+                cursor = conn.exec_driver_sql(sql)
+                columns = list(cursor.keys())
+                rows = []
+                size = 0
+                for _ in range(MAX_ROWS + 1):
+                    row = cursor.fetchone()
+                    if row is None:
+                        break
+                    values = list(row)
+                    for value in values:
+                        if isinstance(value, bytes):
+                            raise TypeError("resource_limit: 不支持二进制单元格")
+                        if len(str(value).encode("utf-8")) > MAX_CELL_BYTES:
+                            raise ValueError("resource_limit: 单元格过大，请缩小查询")
+                    size += len(json.dumps(values, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+                    if size > MAX_RESULT_BYTES:
+                        raise ValueError("resource_limit: 结果过大，请缩小查询")
+                    rows.append(values)
+                if run:
+                    run.check()
+                if interrupted():
+                    raise TimeoutError("query_timeout")
+                return {"columns": columns, "rows": rows[:MAX_ROWS],
+                        "row_count": min(len(rows), MAX_ROWS), "truncated": len(rows) > MAX_ROWS}
+            finally:
+                driver.set_progress_handler(None, 0)
+    except Exception as exc:
+        if run:
+            run.check()
+        if interrupted():
+            raise TimeoutError("query_timeout") from exc
+        raise
+    finally:
+        query_engine.dispose()

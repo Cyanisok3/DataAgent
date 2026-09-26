@@ -5,14 +5,13 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 type Trace = { type: "thinking" | "tool_call" | "tool_result", content: string };
-type Turn = { id: number, user: string, traces: Trace[], answer: string };
+type Turn = { id: number, user: string, traces: Trace[], answer: string,
+    status: "running" | "completed" | "failed" | "cancelled", error?: string };
 type Usage = {
     session_id: string;
-    projected_tokens: number;
-    context_window_tokens: number;
-    dialogue_tokens: number;
-    tool_tokens: number;
-    system_tokens: number;
+    projected_tokens?: number;
+    serialized_bytes?: number;
+    last_llm_call?: { usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null };
     compressed: boolean;
 };
 
@@ -22,6 +21,7 @@ export default function ChatPage() {
     const [loading, setLoading] = useState(false);
     const [usage, setUsage] = useState<Usage | null>(null);
     const turnIdRef = useRef(0);  // 轮次自增 id
+    const sessionIdRef = useRef("");
     const scrollRef = useRef<HTMLDivElement>(null);  // 对话滚动窗口
 
     // 自动滚到底部：新消息/新 chunk 到达时
@@ -31,7 +31,7 @@ export default function ChatPage() {
 
     async function loadUsage() {
         try {
-            const res = await fetch("http://localhost:8000/usage?session_id=test-1");
+            const res = await fetch("http://localhost:8000/usage?session_id=" + encodeURIComponent(sessionIdRef.current));
             setUsage(await res.json());
         } catch (err) {
             console.error(err);
@@ -39,25 +39,28 @@ export default function ChatPage() {
     }
 
     async function handleSend() {
-        if (!input.trim()) return;
+        if (!input.trim() || loading) return;
+        sessionIdRef.current ||= crypto.randomUUID();
         setLoading(true);
 
         // 新建一轮：用户问题 + 空轨迹 + 空回答
         const turnId = ++turnIdRef.current;
-        setTurns(prev => [...prev, { id: turnId, user: input, traces: [], answer: "" }]);
+        setTurns(prev => [...prev, { id: turnId, user: input, traces: [], answer: "", status: "running" }]);
         setInput("");
 
         try {
             const res = await fetch("http://localhost:8000/chat/stream", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ message: input, session_id: "test-1" })
+                body: JSON.stringify({ message: input, session_id: sessionIdRef.current })
             });
+            if (!res.ok) throw new Error(`请求失败：HTTP ${res.status}`);
 
             const reader = res.body?.getReader();
             if (!reader) throw new Error("响应没有流式 body");
             const decoder = new TextDecoder();
             let buffer = "";
+            let receivedDone = false;
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -83,18 +86,26 @@ export default function ChatPage() {
                     } else if (event.type === "tool_result") {
                         appendTrace(turnId, {
                             type: "tool_result",
-                            content: event.output.slice(0, 200)  // 截断，防止刷爆页面
+                            content: (event.is_error ? "查询失败：" : "") + event.output
                         });
-                    } else if (event.type === "text_chunk") {
+                    } else if (event.type === "text_chunk" || event.type === "text") {
                         // 追加到当前轮的 answer（逐字）
                         setTurns(prev => prev.map(t =>
                             t.id === turnId ? { ...t, answer: t.answer + event.content } : t
                         ));
+                    } else if (event.type === "error") {
+                        setTurns(prev => prev.map(t => t.id === turnId ? { ...t, error: event.content ?? event.error } : t));
+                    } else if (event.type === "done") {
+                        receivedDone = true;
+                        setTurns(prev => prev.map(t => t.id === turnId ? { ...t, status: event.status, error: event.error } : t));
                     }
                 }
             }
+            if (!receivedDone) throw new Error("连接已结束，但未收到完成事件；当前回答可能不完整。");
         } catch (err) {
-            console.error(err);
+            setTurns(prev => prev.map(t => t.id === turnId ? {
+                ...t, status: "failed", error: err instanceof Error ? err.message : "请求失败"
+            } : t));
         } finally {
             setLoading(false);
             loadUsage();  // 每轮结束刷新水位条
@@ -119,12 +130,8 @@ export default function ChatPage() {
             {usage && (
                 <div className="mb-4 text-xs text-gray-500">
                     <div className="flex justify-between mb-1">
-                        <span>上下文 {usage.projected_tokens} / {usage.context_window_tokens} tokens</span>
-                        <span>对话 {usage.dialogue_tokens} · 工具 {usage.tool_tokens} · 系统 {usage.system_tokens}{usage.compressed ? " · 已压缩" : ""}</span>
-                    </div>
-                    <div className="h-1.5 bg-gray-200 rounded">
-                        <div className="h-full bg-blue-500 rounded transition-all"
-                             style={{ width: `${Math.min(100, usage.projected_tokens / usage.context_window_tokens * 100)}%` }} />
+                        <span>最近输入估算 {usage.projected_tokens ?? "未知"} tokens · {usage.serialized_bytes ?? "未知"} bytes</span>
+                        <span>实际输入 {usage.last_llm_call?.usage?.prompt_tokens ?? "未提供"} · 输出 {usage.last_llm_call?.usage?.completion_tokens ?? "未提供"}{usage.compressed ? " · 已压缩" : ""}</span>
                     </div>
                 </div>
             )}
@@ -147,11 +154,15 @@ export default function ChatPage() {
                                     tr.type === "tool_call" ? "text-xs border-blue-200 rounded p-1" :
                                         "text-xs border-green-200 rounded p-1"
                             }>
-                                {tr.type === "thinking" ? "💭 " + tr.content :
-                                    tr.type === "tool_call" ? "🔧 " + tr.content :
-                                        "✅ " + tr.content}
+                                {tr.type === "tool_result" ?
+                                    <details><summary>工具结果（展开全文）</summary><pre className="whitespace-pre-wrap break-all">{tr.content}</pre></details> :
+                                    (tr.type === "thinking" ? "行动说明：" : "工具调用：") + tr.content}
                             </div>
                         ))}
+                        <p className="text-xs text-gray-500">
+                            {t.status === "running" ? "处理中" : t.status === "completed" ? "已完成" : "未完成（保留部分回答）"}
+                            {t.error && " · " + t.error}
+                        </p>
 
                         {/* 本轮回答：markdown 渲染（表格/列表/加粗） */}
                         {t.answer && (

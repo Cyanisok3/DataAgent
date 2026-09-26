@@ -1,282 +1,274 @@
-"""
-session_store.py —— 会话持久化（SQLite 存储层 + 压缩账本层）
+"""会话事实与压缩账本。追加事实，事务更新终态，不删除历史。"""
 
-重构后职责（L24）：
-  存储层   管"事实怎么存"：只追加日志，一条不删
-  账本层   管"压缩怎么落"：插入摘要 + 旧行打 replaced_by（只改不删）
-  投影层   已拆到 context.py（纯函数，管"给模型看什么"）
-  压缩编排 已拆到 compaction.py（锁 + 判定 + 摘要 + 落账本）
-
-依赖方向（单向无环）：context（纯函数）← session_store ← compaction ← main
-"""
+import json
 import os
 import sqlite3
+from contextlib import contextmanager
 
-from context import (
-    CONTEXT_WINDOW_TOKENS,
-    SUMMARY_MAX_CHARS,
-    KIND_CHAT,
-    KIND_CONTEXT,
-    KIND_RESULT,
-    estimate_tokens,
-    project_history,
-    find_compressible,
-    truncate_sentence,
+from context import serialize
+
+DB_PATH = os.environ.get(
+    "SESSION_DB_PATH", os.path.join(os.path.dirname(__file__), "sessions.db")
 )
 
-# 测试时可用 SESSION_DB_PATH 指向临时库（不碰产品 sessions.db）
-DB_PATH = os.environ.get("SESSION_DB_PATH", "sessions.db")
 
-
-def _get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # 让查询结果可以按列名访问
-    return conn
+@contextmanager
+def connection():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
-    """建表（第一次启动时调一次）；旧库补列（兼容迁移）+ 回填轮次"""
-    conn = _get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,          -- user / assistant / tool
-            content TEXT NOT NULL,
-            kind TEXT NOT NULL DEFAULT 'chat',  -- chat / context / result / error
-            is_summary INTEGER NOT NULL DEFAULT 0,  -- 1 = LLM 摘要消息
-            replaced_by INTEGER,         -- 被哪条摘要吸收（账本标记，不删除）
-            replaces_range TEXT,         -- 摘要消息：替代了哪些 id，如 "1-7"
-            turn INTEGER NOT NULL DEFAULT 0,  -- 轮次号：user 开新轮
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    with connection() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+            role TEXT NOT NULL, content TEXT NOT NULL, kind TEXT DEFAULT 'chat',
+            is_summary INTEGER DEFAULT 0, replaced_by INTEGER, replaces_range TEXT,
+            turn INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+        for name, declaration in {
+            "kind": "TEXT DEFAULT 'chat'",
+            "is_summary": "INTEGER DEFAULT 0",
+            "replaced_by": "INTEGER",
+            "replaces_range": "TEXT",
+            "turn": "INTEGER DEFAULT 0",
+            "source_ids": "TEXT",
+            "logical_position": "INTEGER",
+        }.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {declaration}")
+        conn.execute("""CREATE TABLE IF NOT EXISTS turns (
+            session_id TEXT, turn INTEGER, status TEXT NOT NULL,
+            answer TEXT DEFAULT '', error TEXT, mode TEXT DEFAULT 'answer',
+            started_at TEXT DEFAULT CURRENT_TIMESTAMP, ended_at TEXT,
+            PRIMARY KEY(session_id, turn))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS query_results (
+            result_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn INTEGER NOT NULL,
+            payload TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY, session_id TEXT, turn INTEGER, type TEXT,
+            payload TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS model_calls (
+            id INTEGER PRIMARY KEY, session_id TEXT, turn INTEGER, phase TEXT,
+            request TEXT, response TEXT, config TEXT, view TEXT,
+            usage TEXT, status TEXT, error TEXT, elapsed_ms INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        _backfill_turns(conn)
+        for row in conn.execute(
+            "SELECT * FROM turns WHERE status='running'"
+        ).fetchall():
+            _finish(
+                conn,
+                row["session_id"],
+                row["turn"],
+                "failed",
+                row["answer"],
+                "process_interrupted",
+                row["mode"],
+            )
+        conn.execute(
+            "UPDATE model_calls SET status='failed',error='process_interrupted' WHERE status='running'"
         )
-    """)
-    # L28：LLM 请求记录表（可观测性：每次发给 LLM 的请求 + 返回 usage）
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS llm_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            turn INTEGER NOT NULL DEFAULT 0,
-            phase TEXT NOT NULL,         -- decision / final / summary
-            model TEXT NOT NULL,
-            prompt_tokens INTEGER,
-            completion_tokens INTEGER,
-            total_tokens INTEGER,
-            request_preview TEXT,        -- 请求前 500 字（审计用，不存完整大请求）
-            response_preview TEXT,       -- 返回前 500 字
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # 兼容迁移：老库缺列就补（幂等，列已存在则跳过）
-    for col, ddl in [
-        ("kind", "TEXT DEFAULT 'chat'"),
-        ("is_summary", "INTEGER NOT NULL DEFAULT 0"),
-        ("replaced_by", "INTEGER"),
-        ("replaces_range", "TEXT"),
-        ("turn", "INTEGER NOT NULL DEFAULT 0"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {ddl}")
-        except sqlite3.OperationalError:
-            pass  # 列已存在
-
-    # L28 修复：只回填 turn=0 的老数据，不重写已有 turn
-    # （旧版每次启动都重写全部 turn，会话 ID 改变时会破坏原有轮次编号）
-    rows = conn.execute(
-        "SELECT id, session_id, role FROM messages WHERE turn = 0 ORDER BY id"
-    ).fetchall()
-    if rows:
-        cur_turn = 0
-        last_sid = None
-        for r in rows:
-            if r["session_id"] != last_sid:
-                last_sid, cur_turn = r["session_id"], 1
-            elif r["role"] == "user":
-                cur_turn += 1
-            conn.execute("UPDATE messages SET turn = ? WHERE id = ?",
-                         (cur_turn, r["id"]))
-    conn.commit()
-    conn.close()
 
 
-def next_turn(session_id: str) -> int:
-    """返回该会话下一个轮次号（当前最大轮 + 1；空会话从 1 开始）"""
-    conn = _get_conn()
-    row = conn.execute(
-        "SELECT COALESCE(MAX(turn), 0) AS m FROM messages WHERE session_id = ?",
-        (session_id,),
-    ).fetchone()
-    conn.close()
-    return row["m"] + 1
+def _backfill_turns(conn):
+    """按会话顺序补零值；已有编号只验证不重写，歧义立即回滚。"""
+    current: dict[str, int] = {}
+    for row in conn.execute("SELECT * FROM messages ORDER BY id").fetchall():
+        if row["is_summary"]:
+            continue
+        sid, turn = row["session_id"], row["turn"]
+        previous = current.get(sid, 0)
+        expected = previous + 1 if row["role"] == "user" else previous
+        if turn:
+            if (row["role"] == "user" and turn <= previous) or (
+                row["role"] != "user" and previous and turn != previous
+            ):
+                raise ValueError(f"turn_migration_conflict: message {row['id']}")
+        else:
+            if not expected:
+                raise ValueError(f"turn_migration_orphan: message {row['id']}")
+            turn = expected
+            conn.execute("UPDATE messages SET turn=? WHERE id=?", (turn, row["id"]))
+        current[sid] = turn
 
 
-def save_message(session_id: str, role: str, content: str,
-                 kind: str = KIND_CHAT, turn: int | None = None):
-    """存一条消息。kind 在写入时声明；turn 不传则沿用当前最大轮"""
-    conn = _get_conn()
-    if turn is None:
+def begin_turn(sid: str, question: str) -> int:
+    with connection() as conn:
         turn = conn.execute(
-            "SELECT COALESCE(MAX(turn), 0) AS m FROM messages WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()["m"]
+            """SELECT MAX(n)+1 FROM (
+            SELECT COALESCE(MAX(turn),0) n FROM messages WHERE session_id=?
+            UNION ALL SELECT COALESCE(MAX(turn),0) FROM turns WHERE session_id=?)""",
+            (sid, sid),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO turns(session_id,turn,status) VALUES (?,?,'running')",
+            (sid, turn),
+        )
+        conn.execute(
+            "INSERT INTO messages(session_id,role,content,turn) VALUES (?,'user',?,?)",
+            (sid, question, turn),
+        )
+        return turn
+
+
+def mark_cancelling(sid, turn):
+    """阻塞调用停止前标记取消待收尾；仅 running 可转换，幂等。"""
+    with connection() as conn:
+        conn.execute(
+            "UPDATE turns SET status='cancelling' "
+            "WHERE session_id=? AND turn=? AND status='running'",
+            (sid, turn),
+        )
+
+
+def _finish(conn, sid, turn, status, answer, error, mode, evidence=None):
+    changed = conn.execute(
+        """UPDATE turns SET status=?, answer=?, error=?, mode=?,
+        ended_at=CURRENT_TIMESTAMP WHERE session_id=? AND turn=?
+        AND status IN ('running','cancelling')""",
+        (status, answer, error, mode, sid, turn),
+    ).rowcount
+    if changed:
+        conn.execute(
+            "INSERT INTO messages(session_id,role,content,turn) VALUES (?,'assistant',?,?)",
+            (sid, answer, turn),
+        )
+        _event(
+            conn,
+            sid,
+            turn,
+            {"type": "done", "status": status, "error": error, "mode": mode,
+             "evidence_ids": (evidence or {}).get("evidence_ids", []),
+             "final_query_id": (evidence or {}).get("final_query_id")},
+        )
+    return bool(changed)
+
+
+def finish_turn(sid, turn, status, answer, error=None, mode="answer", evidence=None):
+    if status not in {"completed", "failed", "cancelled"}:
+        raise ValueError("invalid terminal status")
+    with connection() as conn:
+        return _finish(conn, sid, turn, status, answer, error, mode, evidence)
+
+
+def _event(conn, sid, turn, event):
     conn.execute(
-        "INSERT INTO messages (session_id, role, content, kind, turn) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (session_id, role, content, kind, turn),
+        "INSERT INTO events(session_id,turn,type,payload) VALUES (?,?,?,?)",
+        (sid, turn, event["type"], serialize(event)),
     )
-    conn.commit()
-    conn.close()
 
 
-def load_messages(session_id: str) -> list[dict]:
-    """加载某个会话的全部历史消息（日志：只追加，一条不删）"""
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT id, role, content, kind, is_summary, replaced_by, "
-        "replaces_range, turn FROM messages "
-        "WHERE session_id = ? ORDER BY id",
-        (session_id,),
-    ).fetchall()
-    conn.close()
-    return [{"id": r["id"], "role": r["role"], "content": r["content"],
-             "kind": r["kind"], "is_summary": r["is_summary"],
-             "replaced_by": r["replaced_by"], "replaces_range": r["replaces_range"],
-             "turn": r["turn"]}
-            for r in rows]
+def save_event(sid, turn, event):
+    """工具事实及其事件同事务，调用方在提交后发布。"""
+    with connection() as conn:
+        if event["type"] == "tool_result":
+            result = event.get("result")
+            if result and event["name"] == "execute_sql" and not event.get("cached"):
+                conn.execute(
+                    "INSERT INTO query_results(result_id,session_id,turn,payload) VALUES (?,?,?,?)",
+                    (result["result_id"], sid, turn, serialize(result)),
+                )
+            kind = (
+                "error"
+                if event.get("is_error")
+                else (
+                    "result" if result and event["name"] == "execute_sql" else "context"
+                )
+            )
+            conn.execute(
+                """INSERT INTO messages(session_id,role,content,kind,turn)
+                VALUES (?,'tool',?,?,?)""",
+                (sid, event["output"], kind, turn),
+            )
+        if event["type"] in {"text", "text_chunk"}:
+            conn.execute(
+                "UPDATE turns SET answer=answer || ? WHERE session_id=? AND turn=?",
+                (event["content"], sid, turn),
+            )
+        _event(conn, sid, turn, event)
 
 
-def load_result_by_id(session_id: str, result_id: int) -> str | None:
-    """按 message_id 拉取历史查询结果的完整内容（L27 read_result 工具用）。
-    只返回 kind=result 的消息（防止读取对话/摘要/错误结果）。"""
-    conn = _get_conn()
-    row = conn.execute(
-        "SELECT content FROM messages "
-        "WHERE id = ? AND session_id = ? AND role = 'tool' AND kind = 'result'",
-        (result_id, session_id),
-    ).fetchone()
-    conn.close()
-    return row["content"] if row else None
+def load_messages(sid) -> list[dict]:
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT m.*, COALESCE(t.status,'completed') status,
+            COALESCE(t.mode,'answer') mode FROM messages m LEFT JOIN turns t
+            ON m.session_id=t.session_id AND m.turn=t.turn
+            WHERE m.session_id=? ORDER BY m.id""",
+            (sid,),
+        ).fetchall()
+    messages = [dict(r) for r in rows]
+    completed_turns = [m["turn"] for m in messages if m["status"] == "completed"]
+    latest = max(completed_turns, default=0)
+    for m in messages:
+        m["source_ids"] = json.loads(m["source_ids"]) if m["source_ids"] else []
+        m["protected"] = m["turn"] == latest and m["mode"] == "clarify"
+    return messages
 
 
-# ─── L28：LLM 请求记录（可观测性）──────────────────────────
-
-def save_llm_request(session_id: str, turn: int, phase: str, model: str,
-                     prompt_tokens: int | None, completion_tokens: int | None,
-                     total_tokens: int | None,
-                     request_preview: str = "", response_preview: str = ""):
-    """记录一次 LLM 调用的元信息（L28 可观测性）。
-    phase: decision（决策阶段）/ final（回答阶段）/ summary（压缩）
-    只存 usage + 前后 500 字预览，不存完整大请求（控制体积）。"""
-    conn = _get_conn()
-    conn.execute(
-        "INSERT INTO llm_requests "
-        "(session_id, turn, phase, model, prompt_tokens, completion_tokens, "
-        "total_tokens, request_preview, response_preview) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (session_id, turn, phase, model, prompt_tokens, completion_tokens,
-         total_tokens, request_preview[:500], response_preview[:500]),
-    )
-    conn.commit()
-    conn.close()
-
-
-def latest_llm_usage(session_id: str) -> dict | None:
-    """最近一次 LLM 调用的真实 usage（/usage 接口用，替代重算投影估算）。"""
-    conn = _get_conn()
-    row = conn.execute(
-        "SELECT phase, model, prompt_tokens, completion_tokens, total_tokens, "
-        "created_at FROM llm_requests WHERE session_id = ? "
-        "ORDER BY id DESC LIMIT 1",
-        (session_id,),
-    ).fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {
-        "phase": row["phase"],
-        "model": row["model"],
-        "prompt_tokens": row["prompt_tokens"],
-        "completion_tokens": row["completion_tokens"],
-        "total_tokens": row["total_tokens"],
-        "created_at": row["created_at"],
-    }
+def load_results(sid) -> dict[str, dict]:
+    with connection() as conn:
+        results = {
+            r["result_id"]: json.loads(r["payload"])
+            for r in conn.execute(
+                "SELECT * FROM query_results WHERE session_id=? ORDER BY rowid", (sid,)
+            )
+        }
+        legacy = conn.execute(
+            """SELECT id,content,turn FROM messages WHERE session_id=?
+            AND role='tool' AND kind='result' ORDER BY id""",
+            (sid,),
+        ).fetchall()
+    new_turns = {r.get("turn") for r in results.values()}
+    for row in legacy:
+        if row["turn"] not in new_turns:
+            key = f"legacy:{row['id']}"
+            results[key] = {
+                "result_id": key,
+                "legacy_content": row["content"],
+                "completeness": "unknown",
+                "turn": row["turn"],
+            }
+    return results
 
 
-# ─── 写账本层 ───────────────────────────────────────────────
-
-def apply_summary(session_id: str, segment: list[dict], summary_text: str):
-    """压缩落库：插入摘要行（is_summary=1, replaces_range）+ 旧行打 replaced_by。
-    只改不删——被吸收的消息一行都不删，只是不再进投影。
-    摘要在句子边界截断（L25 修复：旧版 [:400] 硬切会切断数字/口径）。"""
-    conn = _get_conn()
-    first_id = segment[0]["id"]
-    last_id = segment[-1]["id"]
-    safe_summary = truncate_sentence(summary_text, SUMMARY_MAX_CHARS)
-    cur = conn.execute(
-        "INSERT INTO messages (session_id, role, content, kind, is_summary, "
-        "replaces_range) VALUES (?, ?, ?, ?, 1, ?)",
-        (session_id, "assistant", safe_summary, KIND_CHAT,
-         f"{first_id}-{last_id}"),
-    )
-    summary_id = cur.lastrowid
+def apply_summary(sid: str, segment: list[dict], summary: str) -> int:
+    """比较精确来源快照后原子替换；摘要沿用最早逻辑位置。"""
     ids = [m["id"] for m in segment]
-    placeholders = ",".join("?" * len(ids))
-    conn.execute(
-        f"UPDATE messages SET replaced_by = ? WHERE id IN ({placeholders})",
-        [summary_id] + ids,
-    )
-    conn.commit()
-    conn.close()
-
-
-def usage_stats(session_id: str) -> dict:
-    """历史投影的 token 用量分项（L25 token 口径）：
-    系统提示词由 llm 侧计算、main 组装总量；compressed 是真实值。"""
-    history = load_messages(session_id)
-    projected = project_history(history)
-    dialogue_tokens = sum(estimate_tokens(m["content"])
-                          for m in projected
-                          if m["role"] in ("user", "assistant"))
-    tool_tokens = sum(estimate_tokens(m["content"])
-                      for m in projected if m["role"] == "tool")
-    summaries = [m for m in history
-                 if m.get("is_summary") and not m.get("replaced_by")]
-    return {
-        "session_id": session_id,
-        "projected_tokens": dialogue_tokens + tool_tokens,
-        "context_window_tokens": CONTEXT_WINDOW_TOKENS,
-        "dialogue_tokens": dialogue_tokens,
-        "tool_tokens": tool_tokens,
-        "compressed": bool(summaries),
-    }
-
-
-# 自测（安全化：永远用 /tmp 测试库，绝不触碰产品 sessions.db）
-if __name__ == "__main__":
-    import os
-
-    DB_PATH = "/tmp/session_store_selftest.db"
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-
-    init_db()
-
-    sid = "test-session-001"
-    save_message(sid, "user", "各区域销售额是多少？")
-    save_message(sid, "tool", '{"domains": [...], "tables": [...]}',
-                 kind=KIND_CONTEXT)
-    save_message(sid, "tool", "华东 4197.5，华北 2898.0，华南 2298.0",
-                 kind=KIND_RESULT)
-    save_message(sid, "assistant", "各区域销售额如下：华东 4197.5...")
-    save_message(sid, "user", "那华北呢？")
-
-    print("=== 全量日志（事实，永不删）===")
-    for m in load_messages(sid):
-        print(f"[{m['role']}:{m['kind']} turn={m['turn']}] {m['content'][:30]}...")
-
-    print("\n=== 投影（观点：context 已被确定性过滤）===")
-    for m in project_history(load_messages(sid)):
-        print(f"[{m['role']}] {m['content'][:30]}...")
-
-    print("\n=== 压缩判定（短对话应 0 → 不触发）===")
-    print(f"可压缩段: {len(find_compressible(load_messages(sid)))} 条")
+    if not ids or len(ids) != len(set(ids)):
+        raise ValueError("invalid_summary_sources")
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE session_id=? AND id IN ("
+            + ",".join("?" for _ in ids)
+            + ")",
+            [sid, *ids],
+        ).fetchall()
+        snapshots = {m["id"]: m for m in segment}
+        if len(rows) != len(ids) or any(
+            any(r[key] != snapshots[r["id"]].get(key) for key in
+                ("role", "content", "turn", "is_summary", "logical_position", "replaced_by"))
+            or json.loads(r["source_ids"] or "[]") != snapshots[r["id"]].get("source_ids", [])
+            for r in rows
+        ):
+            raise ValueError("stale_summary_sources")
+        position = min(m.get("logical_position") or m["id"] for m in segment)
+        cur = conn.execute(
+            """INSERT INTO messages
+            (session_id,role,content,is_summary,turn,source_ids,logical_position)
+            VALUES (?,'assistant',?,1,?,?,?)""",
+            (sid, summary, min(m["turn"] for m in segment), serialize(ids), position),
+        )
+        summary_id = cur.lastrowid
+        conn.executemany(
+            "UPDATE messages SET replaced_by=? WHERE id=? AND session_id=?",
+            [(summary_id, id_, sid) for id_ in ids],
+        )
+        return summary_id
