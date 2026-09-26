@@ -16,7 +16,11 @@ L25：全部工具返回 ToolResult（统一结构化类型）。
   content 是给模型看的可读文本；sql/columns/row_count/truncated
   供回答阶段组装"查询依据"，解决"查过却无法确认时间范围/口径"。
 """
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TypedDict
+
+from pydantic import ConfigDict, validate_call
 
 from db import execute_query
 from semantic_layer import (
@@ -45,12 +49,14 @@ class ToolResult:
     full_content: str | None = None  # L29：完整查询结果（落库用，read_result 有效）
 
 
+@validate_call(config=ConfigDict(strict=True))
 def get_domains() -> ToolResult:
     """工具：列出所有可用数据域"""
     lines = [f"- {d.key}（{d.name}）：{d.description}" for d in DOMAINS]
     return ToolResult(content="可用数据域：\n" + "\n".join(lines))
 
 
+@validate_call(config=ConfigDict(strict=True))
 def get_tables(question: str) -> ToolResult:
     """工具：根据问题列出相关表（只给表名+描述；列信息用 get_table_schema 单独取）"""
     domains = match_domains(question)
@@ -60,6 +66,7 @@ def get_tables(question: str) -> ToolResult:
     return ToolResult(content="相关表：\n" + "\n".join(lines))
 
 
+@validate_call(config=ConfigDict(strict=True))
 def get_table_schema(table_name: str) -> ToolResult:
     """工具：单表完整 schema（列名 + 业务含义），写 SQL 前必调。"""
     name = table_name.strip().lower()
@@ -76,6 +83,7 @@ def get_table_schema(table_name: str) -> ToolResult:
         content=f"未找到表 {table_name}。请先用 get_tables 确认表名。")
 
 
+@validate_call(config=ConfigDict(strict=True))
 def get_metric_caliber(hint: str) -> ToolResult:
     """工具：指标的业务口径（计算表达式、数据表、时间字段、过滤条件），
     让模型使用统一口径而不是自己发明算法。"""
@@ -95,6 +103,7 @@ def get_metric_caliber(hint: str) -> ToolResult:
     return ToolResult(content="\n".join(lines))
 
 
+@validate_call(config=ConfigDict(strict=True))
 def execute_sql(sql: str) -> ToolResult:
     """工具：先过安全护栏，再执行 SQL，返回 ToolResult（含结构化执行依据）。
     错误文本保持简短（异常 + 引导语），模型据此调 get_table_schema 自我修正。"""
@@ -118,8 +127,13 @@ def execute_sql(sql: str) -> ToolResult:
             is_error=True, error_type="execution")
 
 
-# 工具注册表：名字 → (函数, 参数描述)。system prompt 据此告诉模型怎么调。
-TOOLS = {
+class ToolSpec(TypedDict):
+    fn: Callable[..., ToolResult]
+    params: str
+
+
+# 调用参数由函数签名和 validate_call 校验，不另维护一份参数字段模型。
+TOOLS: dict[str, ToolSpec] = {
     "get_domains": {
         "fn": get_domains,
         "params": "无参数",

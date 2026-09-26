@@ -20,11 +20,14 @@ llm.py —— 接 DeepSeek（兼容 OpenAI API）
 import json
 import sqlite3
 from datetime import date, timedelta
+
 from openai import OpenAI
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from context import (
     KIND_RESULT,
     SUMMARY_MAX_CHARS,
+    WATERMARK_TOKENS,
     estimate_tokens,
     tool_result_view,
 )
@@ -64,11 +67,11 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一个数据查询助手。你可以调用以
 1. 用 get_tables 找到相关表；写 SQL 前必须用 get_table_schema 确认列名与时间字段
 2. 涉及销售额/订单量/客单价/活跃客户数/销量等指标时，先调 get_metric_caliber
    获取标准口径，严格使用其表达式与过滤条件，不要自己发明算法
-3. 写 SQL，调 execute_sql；拿到结果后直接总结回答，不再调工具
+3. 写 SQL，调 execute_sql；取得回答所需的全部依据后再总结，必要时继续查询
 4. "今天/昨天/最近 N 天/上周/本月"等相对日期，按上面的当前日期换算
    （可直接用 CURRENT_DATE 计算）
-5. execute_sql 返回以 ❌ 开头的错误时：调 get_table_schema 核对列名后重写，
-   不要重复同样的错误 SQL；重试 2 次仍失败就基于已有信息回答
+5. 根据工具错误类型修正参数或 SQL，必要时调 get_table_schema；
+   不要重复同样的错误；没有成功数据时明确说明失败，不编造结果
 6. 不要重复调用目的与参数完全相同的工具；已拿到所需信息就直接进入下一步
 7. 历史查询结果以索引列表形式提供（含 ID、SQL 摘要、行数、预览）。
    追问历史数据时，先看索引找到对应 result_id，再调 read_result(result_id=ID)
@@ -151,7 +154,11 @@ def _tool_chain(messages: list[dict]) -> str:
     lines: list[str] = []
     duplicate = False
     for m in tools[-TOOL_CHAIN_MAX_ITEMS:]:
-        view = tool_result_view(m["content"], m.get("kind", KIND_RESULT))
+        # 查询证据不可再按字符串前缀裁剪；请求整体超预算时由调用入口拒绝。
+        view = (m["content"] if m.get("name") in ("execute_sql", "read_result")
+                else tool_result_view(m["content"], m.get("kind", KIND_RESULT)))
+        if m.get("name"):
+            view = f"{m['name']}({json.dumps(m.get('input', {}), ensure_ascii=False)}):\n{view}"
         if view in seen:
             duplicate = True
             continue
@@ -168,12 +175,30 @@ def _tool_chain(messages: list[dict]) -> str:
 
 def _completion(api_messages: list[dict], stream: bool = False):
     """唯一 API 调用入口：stream=False 一次性返回；True 返回逐字生成器"""
+    if estimate_tokens(json.dumps(api_messages, ensure_ascii=False)) > WATERMARK_TOKENS:
+        raise ValueError("context_insufficient: 请求超过应用输入预算，请缩小查询范围")
     return client.chat.completions.create(
         model=MODEL,
         messages=api_messages,
         temperature=0,  # 贪心解码，输出稳定
         stream=stream,
     )
+
+
+class ToolAction(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    thought: str
+    tool: str
+    args: dict[str, object]
+
+
+class AnswerAction(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    thought: str
+    final: str
+
+
+_ACTION: TypeAdapter[ToolAction | AnswerAction] = TypeAdapter(ToolAction | AnswerAction)
 
 
 def _parse_json(content: str) -> dict:
@@ -183,7 +208,7 @@ def _parse_json(content: str) -> dict:
         content = content.split("```")[1]
         if content.startswith("json"):
             content = content[4:]
-    return json.loads(content)
+    return _ACTION.validate_python(json.loads(content)).model_dump()
 
 
 # ---------- 两个语义不同的公开函数 ----------
@@ -246,22 +271,22 @@ def chat(messages: list[dict], history: list[dict] | None = None,
                 response_preview=(content or "")[:500],
             )
         try:
-            return _parse_json(content)
-        except json.JSONDecodeError:
+            return _parse_json(content or "")
+        except (json.JSONDecodeError, ValidationError):
             if attempt == 1:
                 raise
             api_messages.append({
                 "role": "user",
-                "content": ("你上一次回复不是合法 JSON。请严格只输出以下两种格式之一，"
+                "content": ("上一次回复的 JSON 或动作字段不合法。请严格只输出以下两种格式之一，"
                             "不要任何其他文字或 markdown："
                             '{"thought": "思考", "tool": "工具名", "args": {...}} '
                             '或 {"thought": "思考", "final": "回答"}'),
             })
 
 
-def chat_stream_final(user_message: str, tool_output: str,
+def chat_stream_final(user_message: str, tool_output: str | None,
                       history: list[dict] | None = None,
-                      sql_evidence: list[tuple[str, str]] | None = None):
+                      sql_evidence: list[tuple[str | None, str]] | None = None):
     """
     回答阶段（流式）：逐字生成最终回答，供前端实时渲染。
     不用 JSON 协议，直接生成自然语言。
@@ -275,12 +300,15 @@ def chat_stream_final(user_message: str, tool_output: str,
     """
     parts = []
     if sql_evidence:
-        lines = [f"SQL: {sql}\n结果: {result}"
+        lines = [f"SQL: {sql or '历史记录中的原始 SQL（如有）'}\n结果: {result}"
                  for sql, result in sql_evidence]
         parts.append("本轮查询依据（实际执行的 SQL 与结果）：\n"
                      + "\n\n".join(lines))
     elif tool_output:
         parts.append(f"工具返回结果：\n{tool_output}")
+    else:
+        parts.append("本轮没有取得成功查询或读取的证据。涉及数据时说明依据不足，"
+                     "不要把历史索引预览当作完整结果；普通问候可直接回答。")
     # L27：历史中的 tool 消息是合并的结果索引列表，直接展示
     hist_tools = [m["content"] for m in (history or []) if m["role"] == "tool"]
     if hist_tools:
