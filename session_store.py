@@ -43,11 +43,27 @@ def init_db():
             session_id TEXT NOT NULL,
             role TEXT NOT NULL,          -- user / assistant / tool
             content TEXT NOT NULL,
-            kind TEXT NOT NULL DEFAULT 'chat',  -- chat / context / result
+            kind TEXT NOT NULL DEFAULT 'chat',  -- chat / context / result / error
             is_summary INTEGER NOT NULL DEFAULT 0,  -- 1 = LLM 摘要消息
             replaced_by INTEGER,         -- 被哪条摘要吸收（账本标记，不删除）
             replaces_range TEXT,         -- 摘要消息：替代了哪些 id，如 "1-7"
             turn INTEGER NOT NULL DEFAULT 0,  -- 轮次号：user 开新轮
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # L28：LLM 请求记录表（可观测性：每次发给 LLM 的请求 + 返回 usage）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            turn INTEGER NOT NULL DEFAULT 0,
+            phase TEXT NOT NULL,         -- decision / final / summary
+            model TEXT NOT NULL,
+            prompt_tokens INTEGER,
+            completion_tokens INTEGER,
+            total_tokens INTEGER,
+            request_preview TEXT,        -- 请求前 500 字（审计用，不存完整大请求）
+            response_preview TEXT,       -- 返回前 500 字
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -64,19 +80,21 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # 列已存在
 
-    # 回填轮次：老数据（turn 全 0）按 id 顺序，user 开新轮，其余沿用
+    # L28 修复：只回填 turn=0 的老数据，不重写已有 turn
+    # （旧版每次启动都重写全部 turn，会话 ID 改变时会破坏原有轮次编号）
     rows = conn.execute(
-        "SELECT id, session_id, role FROM messages ORDER BY id"
+        "SELECT id, session_id, role FROM messages WHERE turn = 0 ORDER BY id"
     ).fetchall()
-    cur_turn = 0
-    last_sid = None
-    for r in rows:
-        if r["session_id"] != last_sid:
-            last_sid, cur_turn = r["session_id"], 1
-        elif r["role"] == "user":
-            cur_turn += 1
-        conn.execute("UPDATE messages SET turn = ? WHERE id = ?",
-                     (cur_turn, r["id"]))
+    if rows:
+        cur_turn = 0
+        last_sid = None
+        for r in rows:
+            if r["session_id"] != last_sid:
+                last_sid, cur_turn = r["session_id"], 1
+            elif r["role"] == "user":
+                cur_turn += 1
+            conn.execute("UPDATE messages SET turn = ? WHERE id = ?",
+                         (cur_turn, r["id"]))
     conn.commit()
     conn.close()
 
@@ -138,6 +156,50 @@ def load_result_by_id(session_id: str, result_id: int) -> str | None:
     ).fetchone()
     conn.close()
     return row["content"] if row else None
+
+
+# ─── L28：LLM 请求记录（可观测性）──────────────────────────
+
+def save_llm_request(session_id: str, turn: int, phase: str, model: str,
+                     prompt_tokens: int | None, completion_tokens: int | None,
+                     total_tokens: int | None,
+                     request_preview: str = "", response_preview: str = ""):
+    """记录一次 LLM 调用的元信息（L28 可观测性）。
+    phase: decision（决策阶段）/ final（回答阶段）/ summary（压缩）
+    只存 usage + 前后 500 字预览，不存完整大请求（控制体积）。"""
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO llm_requests "
+        "(session_id, turn, phase, model, prompt_tokens, completion_tokens, "
+        "total_tokens, request_preview, response_preview) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (session_id, turn, phase, model, prompt_tokens, completion_tokens,
+         total_tokens, request_preview[:500], response_preview[:500]),
+    )
+    conn.commit()
+    conn.close()
+
+
+def latest_llm_usage(session_id: str) -> dict | None:
+    """最近一次 LLM 调用的真实 usage（/usage 接口用，替代重算投影估算）。"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT phase, model, prompt_tokens, completion_tokens, total_tokens, "
+        "created_at FROM llm_requests WHERE session_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "phase": row["phase"],
+        "model": row["model"],
+        "prompt_tokens": row["prompt_tokens"],
+        "completion_tokens": row["completion_tokens"],
+        "total_tokens": row["total_tokens"],
+        "created_at": row["created_at"],
+    }
 
 
 # ─── 写账本层 ───────────────────────────────────────────────

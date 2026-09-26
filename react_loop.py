@@ -35,11 +35,13 @@ KNOWN_TOOL_NAMES: set[str] = set(TOOLS.keys()) | {"read_result"}
 
 
 def run_react_stream(user_message: str, history: list[dict] | None = None,
-                     full_history: list[dict] | None = None):
+                     full_history: list[dict] | None = None,
+                     session_id: str | None = None, turn: int = 0):
     """
     流式版：思考/工具调用是步骤级流式，最终回答是逐字流式
     history：投影后的历史（多轮上下文，含结果索引），传给 LLM
     full_history：完整日志（供 read_result 按需拉取历史查询结果）
+    session_id / turn：L28 可观测性——记录 LLM 调用 usage 时关联会话与轮次
 
     事件协议：
       thinking     模型思考（完整一段）
@@ -59,7 +61,7 @@ def run_react_stream(user_message: str, history: list[dict] | None = None,
     for i in range(MAX_ITERS):
         # 1. 想（一次性 JSON，因为要解析 tool/args）
         try:
-            result = chat(messages, history)
+            result = chat(messages, history, session_id=session_id, turn=turn)
         except Exception as e:
             yield {"type": "thinking",
                    "content": f"模型输出解析失败（{type(e).__name__}），已中止本轮"}
@@ -134,6 +136,7 @@ def run_react_stream(user_message: str, history: list[dict] | None = None,
 
         yield {"type": "tool_result", "name": tool_name,
                "input": tool_args, "output": tool_result.content,
+               "full_output": tool_result.full_content,
                "is_error": tool_result.is_error,
                "error_type": tool_result.error_type,
                "sql": tool_result.sql,

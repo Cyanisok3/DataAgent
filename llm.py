@@ -28,6 +28,7 @@ from context import (
     estimate_tokens,
     tool_result_view,
 )
+from session_store import save_llm_request
 
 # 读 API key（从文件读，不硬编码）
 with open("api_key.txt") as f:
@@ -109,15 +110,18 @@ def system_prompt_tokens() -> int:
 # 最终回答阶段的 system prompt：纯总结，不要 JSON、不要思考过程
 # L24 证据约束：事实与推测分开，趋势/原因类结论必须有计算或数据支撑
 # L25 数值格式化：金额/比率/百分比统一小数位，避免 15 位小数
+# L29 不完整周期约束：本月过半不能说环比，数据截止日期必须说明
 FINAL_SYSTEM_PROMPT = (
     "你是数据查询助手。根据已有的数据与计算结果，用简洁清晰的语言回答用户。\n"
     "严格遵守：\n"
     "1. 只陈述已经计算或数据中明确存在的事实，具体数字保持原样\n"
     "2. 增长、下降、反超、趋势等判断，必须有对应计算支撑（等长前期对比、同比、"
     "按月序列等）；没有计算就明确写“需补充数据验证”，不得直接断言\n"
-    "3. 原因解释（促销、旺季、活动等）必须有事件数据支持，否则标注为推测或不写\n"
-    "4. 回答中事实、推测、建议分开呈现。直接输出回答，不要思考过程。\n"
-    "5. 数值格式化：金额保留 2 位小数，百分比保留 1-2 位小数，"
+    "3. 不完整周期不得做同比/环比结论：例如本月才过一半，不能说“本月环比增长”，"
+    "只能说“截至目前”；数据只覆盖到某天时，必须说明数据截止日期\n"
+    "4. 原因解释（促销、旺季、活动等）必须有事件数据支持，否则标注为推测或不写\n"
+    "5. 回答中事实、推测、建议分开呈现。直接输出回答，不要思考过程。\n"
+    "6. 数值格式化：金额保留 2 位小数，百分比保留 1-2 位小数，"
     "客单价/比率保留 2 位小数；不要输出超过 4 位的小数。"
 )
 
@@ -184,7 +188,8 @@ def _parse_json(content: str) -> dict:
 
 # ---------- 两个语义不同的公开函数 ----------
 
-def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
+def chat(messages: list[dict], history: list[dict] | None = None,
+         session_id: str | None = None, turn: int = 0) -> dict:
     """
     决策阶段（非流式）：返回结构化 JSON，供 ReAct 循环解析工具调用。
     输入：当前轮消息 + 投影后的历史（可选）
@@ -192,6 +197,7 @@ def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
 
     L21：决策上下文 = 本轮工具链（多步，_tool_chain）+ 历史投影里的事实结果
          （hist_tools）——追问时模型能看到旧数字，而不是只看到本轮最后一步。
+    L28：记录每次 LLM 调用的 usage（可观测性）。
     """
     user_msg = next(
         m["content"] for m in reversed(messages) if m["role"] == "user"
@@ -225,8 +231,20 @@ def chat(messages: list[dict], history: list[dict] | None = None) -> dict:
     # 模型偶尔会输出非 JSON（典型：超短追问时直接回"好的"），
     # 把解析错误反馈给它，要求重新输出严格 JSON——agent 工程常规做法。
     for attempt in range(2):
-        resp = _completion(api_messages)
+        resp = _completion(api_messages) # api call here
         content = resp.choices[0].message.content
+        # L28：记录 LLM 调用 usage（可观测性；session_id 为空时不记录，如自测）
+        if session_id:
+            usage = resp.usage
+            save_llm_request(
+                session_id=session_id, turn=turn, phase="decision",
+                model=MODEL,
+                prompt_tokens=usage.prompt_tokens if usage else None,
+                completion_tokens=usage.completion_tokens if usage else None,
+                total_tokens=usage.total_tokens if usage else None,
+                request_preview=api_messages[-1]["content"][:500],
+                response_preview=(content or "")[:500],
+            )
         try:
             return _parse_json(content)
         except json.JSONDecodeError:
@@ -281,10 +299,11 @@ def chat_stream_final(user_message: str, tool_output: str,
             yield chunk.choices[0].delta.content
 
 
-def summarize_history(messages: list[dict]) -> str:
+def summarize_history(messages: list[dict], session_id: str | None = None) -> str:
     """把要压缩的旧段压成中文摘要（L25 强化保真）：
     原样保留所有数字/日期/表名/口径/结论；不保留过程性状态（等待授权等）；
-    忽略思考与工具调用细节。失败/空返回 ""（压缩可跳过）。"""
+    忽略思考与工具调用细节。失败/空返回 ""（压缩可跳过）。
+    L28：记录 LLM 调用 usage（phase=summary）。"""
     text = "\n".join(
         f"{'用户' if m['role'] == 'user' else '助手'}：{m['content']}"
         for m in messages
@@ -299,7 +318,20 @@ def summarize_history(messages: list[dict]) -> str:
                     "只输出摘要本身。"},
         {"role": "user", "content": text},
     ])
-    return (resp.choices[0].message.content or "").strip()
+    content = (resp.choices[0].message.content or "").strip()
+    # L28：记录压缩阶段的 LLM usage
+    if session_id:
+        usage = resp.usage
+        save_llm_request(
+            session_id=session_id, turn=0, phase="summary",
+            model=MODEL,
+            prompt_tokens=usage.prompt_tokens if usage else None,
+            completion_tokens=usage.completion_tokens if usage else None,
+            total_tokens=usage.total_tokens if usage else None,
+            request_preview=text[:500],
+            response_preview=content[:500],
+        )
+    return content
 
 
 # 自测

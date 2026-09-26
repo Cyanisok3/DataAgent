@@ -16,27 +16,23 @@ L22：per-session 压缩锁（防并发双摘要）+ 压缩移入后台 daemon �
 import json
 import threading
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from react_loop import run_react_stream
-from context import (
-    project_history,
-    CONTEXT_TOOLS,
-    KIND_CONTEXT,
-    KIND_RESULT,
-    KIND_ERROR,
-)
+from context import project_history
 from session_store import (
     init_db, save_message, load_messages, next_turn, usage_stats,
+    latest_llm_usage,
 )
 from compaction import maybe_compress
 from db import init_db as init_business_db
 from llm import system_prompt_tokens
+from event_logger import log_tool_result, log_invocation
 
-app = FastAPI(title="Data Agent", version="0.7")
+app = FastAPI(title="Data Agent", version="0.8")
 
 # CORS：允许前端 3000 端口跨域访问
 app.add_middleware(
@@ -46,6 +42,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# L28：同会话请求串行化锁（防止两个请求交错写 turn / 消息）
+_session_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _get_session_lock(session_id: str) -> threading.Lock:
+    """获取指定会话的锁（不存在则创建，线程安全）。"""
+    with _locks_guard:
+        if session_id not in _session_locks:
+            _session_locks[session_id] = threading.Lock()
+        return _session_locks[session_id]
 
 
 # 启动时建表
@@ -67,6 +75,10 @@ def _session_pipeline(session_id: str, message: str):
       turn       = next_turn：user 开新轮，本轮 tool/assistant 沿用
       落库顺序：user → tool（按 kind 声明）→ assistant（流式拼接）
       压缩：事件流结束前启动后台 daemon 线程（SSE 立即关闭，L22 P2-2）
+
+    L28：同会话串行化（调用方持锁）；try/finally 保证客户端断开时
+         assistant 消息和压缩不丢失；run_react_stream 传 session_id/turn
+         供 LLM usage 记录关联。
     """
     full_history = load_messages(session_id)
     projected = project_history(full_history)
@@ -74,46 +86,39 @@ def _session_pipeline(session_id: str, message: str):
     save_message(session_id, "user", message, turn=turn)
 
     final_answer = ""
-    for event in run_react_stream(message, projected, full_history):
-        if event["type"] == "text_chunk":
-            final_answer += event["content"]
-        elif event["type"] == "tool_result":
-            # kind 判定（L26）：
-            #   执行失败 → error（留档审计，不占历史事实名额）
-            #   schema/口径/表清单 → context（引导性，消费完即弃）
-            #   execute_sql 成功 → result（事实性，可被追问引用）
-            if event.get("is_error"):
-                kind = KIND_ERROR
-            elif event["name"] in CONTEXT_TOOLS:
-                kind = KIND_CONTEXT
-            else:
-                kind = KIND_RESULT
-            # header：工具名+参数；对 execute_sql 附加护栏改写后实际执行的 SQL
-            header = f"[{event['name']}({json.dumps(event.get('input', {}), ensure_ascii=False)})"
-            if event.get("sql"):
-                header += f" → SQL: {event['sql']}"
-            header += "]"
-            save_message(session_id, "tool", f"{header}\n{event['output']}",
-                         kind, turn=turn)
-            # 控制台可观测性日志（L26）：编号+耗时+工具名+实际SQL
-            print(f"[工具#{event.get('invocation', '?')} "
-                  f"{event['name']} {event.get('elapsed_ms', '?')}ms"
-                  f"{' ERROR' if event.get('is_error') else ''}] "
-                  f"{event.get('sql') or event.get('input', '')}")
-        elif event["type"] == "text":          # max_iters 兜底分支
-            final_answer = event["content"]
-        elif event["type"] == "done":
-            # 轮次终态日志（不进 trace，不进 SSE 之外的存储）
-            print(f"[轮次结束] status={event['status']} "
-                  f"invocations={event.get('invocations', 0)} "
-                  f"session={session_id}")
-        yield event
-
-    if final_answer:
-        save_message(session_id, "assistant", final_answer, turn=turn)
-
-    # 压缩交给后台线程：事件流立即结束 → SSE 连接马上关闭（daemon 不拦进程退出）
-    threading.Thread(target=maybe_compress, args=(session_id,), daemon=True).start()
+    cancelled = False
+    try:
+        for event in run_react_stream(message, projected, full_history,
+                                       session_id=session_id, turn=turn):
+            if event["type"] == "text_chunk":
+                final_answer += event["content"]
+            elif event["type"] == "tool_result":
+                # L29：落库与控制台日志抽到 event_logger.py，main.py 只编排
+                log_tool_result(event, session_id, turn)
+                log_invocation(event)
+            elif event["type"] == "text":          # max_iters 兜底分支
+                final_answer = event["content"]
+            elif event["type"] == "done":
+                # 轮次终态日志（不进 trace，不进 SSE 之外的存储）
+                print(f"[轮次结束] status={event['status']} "
+                      f"invocations={event.get('invocations', 0)} "
+                      f"session={session_id}")
+            yield event
+    except GeneratorExit:
+        # L28：客户端断开（SSE 连接关闭）——记录 cancelled，finally 仍会落库
+        cancelled = True
+        print(f"[轮次结束] status=cancelled (client disconnected) "
+              f"session={session_id}")
+        raise
+    finally:
+        # L28：try/finally 保证——即使客户端断开，assistant 消息和压缩也不丢失
+        if final_answer:
+            save_message(session_id, "assistant", final_answer, turn=turn)
+        if cancelled:
+            print(f"[清理] 客户端断开，已落库 assistant（{len(final_answer)} 字）"
+                  f" session={session_id}")
+        # 压缩交给后台线程：事件流立即结束 → SSE 连接马上关闭（daemon 不拦进程退出）
+        threading.Thread(target=maybe_compress, args=(session_id,), daemon=True).start()
 
 
 @app.get("/")
@@ -127,13 +132,15 @@ def chat(req: ChatRequest):
     if not req.message.strip():
         return {"answer": "请先输入想问的问题。", "trace": []}
     answer, trace = "", []
-    for event in _session_pipeline(req.session_id, req.message):
-        if event["type"] == "text_chunk":
-            answer += event["content"]
-        elif event["type"] == "text":
-            answer = event["content"]
-        if event["type"] not in ("text_chunk", "done"):
-            trace.append(event)
+    # L28：同会话串行化——防止两个请求交错写 turn/消息
+    with _get_session_lock(req.session_id):
+        for event in _session_pipeline(req.session_id, req.message):
+            if event["type"] == "text_chunk":
+                answer += event["content"]
+            elif event["type"] == "text":
+                answer = event["content"]
+            if event["type"] not in ("text_chunk", "done"):
+                trace.append(event)
     return {"answer": answer, "trace": trace}
 
 
@@ -147,18 +154,26 @@ def chat_stream(req: ChatRequest):
                 {"type": "text", "content": "请先输入想问的问题。"},
                 ensure_ascii=False) + "\n\n")
             return
-        for event in _session_pipeline(req.session_id, req.message):
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        # L28：同会话串行化
+        with _get_session_lock(req.session_id):
+            for event in _session_pipeline(req.session_id, req.message):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/usage")
 def usage(session_id: str = "default"):
-    """前端水位条：token 用量构成（对话/工具/系统 + 水位 + 是否已压缩）。
-    只读 → GET + query 参数。总量 = 历史投影 + 系统提示词。"""
+    """前端水位条：token 用量构成。
+    L28：同时返回投影估算（参考）和最近一次真实 LLM usage（权威）。
+    真实 usage 来自 llm_requests 表，不再是重新投影的估算值。"""
     stats = usage_stats(session_id)
     system_tokens = system_prompt_tokens()
     stats["system_tokens"] = system_tokens
     stats["projected_tokens"] += system_tokens
+    # L28：最近一次真实 LLM 调用的 usage（替代"重算投影"作为权威用量）
+    real = latest_llm_usage(session_id)
+    stats["last_llm_call"] = real
+    if real and real.get("total_tokens"):
+        stats["actual_total_tokens"] = real["total_tokens"]
     return stats

@@ -20,6 +20,7 @@ teaching scaffolding must not weaken the production design.
   `requirements.txt` first); (4) only then custom code.
 - Avoid over-encapsulation: extract a shared helper only when a pattern appears
   ≥2 times. A one-off private method that clarifies intent is fine.
+- Consider Using Minimal Diff skill when planning a fixing plan or starting to fix bugs.
 - Do not hand-write boilerplate: use `@dataclass`, Pydantic models, and tooling
   generation. Prefer keyword construction for records with many fields.
 - Use explicit module-level imports; never `from module import *`. When a local

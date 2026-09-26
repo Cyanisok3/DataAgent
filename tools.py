@@ -32,7 +32,8 @@ from sql_guard import SqlSecurityError, validate_and_transform
 @dataclass
 class ToolResult:
     """统一工具返回类型（评审文档第 6 节）。
-    content 是给模型看的可读文本；结构化字段供回答阶段和日志使用。"""
+    content 是给模型看的可读文本（前 20 行）；full_content 是完整结果
+    （落库用，L29 工具结果完整留档）；结构化字段供回答阶段和日志使用。"""
     content: str
     is_error: bool = False
     error_type: str | None = None  # "security" | "execution" | None
@@ -41,6 +42,7 @@ class ToolResult:
     columns: list[str] = field(default_factory=list)
     row_count: int = 0
     truncated: bool = False         # 是否被前 20 行截断
+    full_content: str | None = None  # L29：完整查询结果（落库用，read_result 有效）
 
 
 def get_domains() -> ToolResult:
@@ -103,7 +105,9 @@ def execute_sql(sql: str) -> ToolResult:
                           is_error=True, error_type="security")
     try:
         result = execute_query(safe_sql)
-        return ToolResult(content=result["content"], sql=safe_sql,
+        return ToolResult(content=result["content"],
+                          full_content=result["full_content"],
+                          sql=safe_sql,
                           columns=result["columns"],
                           row_count=result["row_count"],
                           truncated=result["truncated"])

@@ -204,7 +204,7 @@ METRICS = {
         description="卖出的商品件数（订单明细行数，每个 SKU 一行）",
         table="items",
         sql_expression="COUNT(items.id)",
-        time_field="",
+        time_field="orders.ordered_at",
         filters="",
         aliases=["卖了多少件", "销售件数", "售出多少", "商品销量", "卖", "销量"],
         # 按商品统计销量必须 JOIN：orders（时间范围）、products（商品名称）

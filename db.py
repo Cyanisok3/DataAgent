@@ -160,9 +160,12 @@ def _load_csv(conn, filename, table, columns, **casts):
 
 
 def execute_query(sql: str) -> dict:
-    """执行 SELECT SQL，返回结构化结果（L25：供 ToolResult 组装执行依据）。
-    返回 {"content": str, "columns": list, "row_count": int, "truncated": bool}。
-    content 是给模型看的可读文本（前 20 行）；row_count 是实际匹配行数。"""
+    """执行 SELECT SQL，返回结构化结果（L25 + L29）。
+    返回 {"content": str, "full_content": str, "columns": list,
+           "row_count": int, "truncated": bool}。
+    content      = 前 20 行（给模型决策和前端展示，控制 token）
+    full_content = 完整结果（落库用，保证 read_result 能拿到全部数据）
+    row_count    = 实际匹配行数；sql_guard 已加 LIMIT 200，完整结果可控。"""
     with engine.connect() as conn:
         result = conn.execute(text(sql))
 
@@ -171,9 +174,16 @@ def execute_query(sql: str) -> dict:
         row_count = len(rows)
 
         if not rows:
-            return {"content": "查询结果为空。", "columns": columns,
-                    "row_count": 0, "truncated": False}
+            return {"content": "查询结果为空。", "full_content": "查询结果为空。",
+                    "columns": columns, "row_count": 0, "truncated": False}
 
+        # 完整结果（落库用）：sql_guard LIMIT 200，最多 200 行
+        full_lines = [f"Columns: {columns}", f"Total rows: {row_count}"]
+        for row in rows:
+            full_lines.append(str(dict(row._mapping)))
+        full_content = "\n".join(full_lines)
+
+        # 展示版（前 20 行）：给模型决策和前端展示，控制 token
         lines = [f"Columns: {columns}", f"Total rows: {row_count}"]
         for row in rows[:20]:
             lines.append(str(dict(row._mapping)))
@@ -181,8 +191,8 @@ def execute_query(sql: str) -> dict:
         if truncated:
             lines.append(f"（已截断，仅显示前 20 行，共 {row_count} 行）")
 
-        return {"content": "\n".join(lines), "columns": columns,
-                "row_count": row_count, "truncated": truncated}
+        return {"content": "\n".join(lines), "full_content": full_content,
+                "columns": columns, "row_count": row_count, "truncated": truncated}
 
 
 # 自测
