@@ -41,6 +41,9 @@ def prepare_query(sql: str, allowed: dict[str, list[str]], *, fixed_clock: bool 
                 if isinstance(source, exp.Table) and source.name.lower() not in allowed:
                     raise SqlSecurityError(f"表不在可访问目录中：{source.name}")
         for func in ast.find_all(exp.Func):
+            # SQLGlot 将逻辑连接符也归入 Func；子节点仍会逐一检查。
+            if isinstance(func, (exp.And, exp.Or)):
+                continue
             name = func.name if isinstance(func, exp.Anonymous) else func.sql_name()
             if fixed_clock and (
                 name.upper().startswith("CURRENT_")

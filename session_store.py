@@ -58,6 +58,9 @@ def init_db():
             request TEXT, response TEXT, config TEXT, view TEXT,
             usage TEXT, status TEXT, error TEXT, elapsed_ms INTEGER,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        call_columns = {r["name"] for r in conn.execute("PRAGMA table_info(model_calls)")}
+        if "finish_reason" not in call_columns:
+            conn.execute("ALTER TABLE model_calls ADD COLUMN finish_reason TEXT")
         _backfill_turns(conn)
         for row in conn.execute(
             "SELECT * FROM turns WHERE status='running'"

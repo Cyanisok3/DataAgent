@@ -32,3 +32,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Benchmark
+minidev/
+benchmark/data/
+benchmark/runs/

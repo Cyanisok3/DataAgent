@@ -2,12 +2,13 @@
 import argparse
 import ast
 import json
+import math
 import multiprocessing
 import sqlite3
 import sys
 from pathlib import Path
 
-from scripts.bird_data import (
+from benchmark.bird_data import (
     ASSETS,
     SCORER_REVISION,
     database_path,
@@ -62,6 +63,8 @@ def _score_worker(channel, predicted, gold, db_path, assets):
 
 
 def score_one(predicted, gold, db_path: Path, assets: Path, timeout=30.0):
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("positive_finite_timeout_required")
     ctx = multiprocessing.get_context("spawn")
     reader, writer = ctx.Pipe(duplex=False)
     process = ctx.Process(target=_score_worker, args=(writer, predicted, gold, str(db_path), str(assets)))
@@ -107,6 +110,8 @@ def score_run(run_dir: Path, assets: Path, root: Path, timeout: float):
                  if record["status"] == "completed" and record.get("sql")
                  else {"res": 0, "error": record.get("error") or "no_valid_final_query"})
         scores.append(dict(score, question_id=q["question_id"], db_id=q["db_id"]))
+    if any(file_hash(path) != manifest["databases"][id_] for id_, path in paths.items()):
+        raise ValueError("database_changed_during_scoring")
     report = {"metric": "official_EX_full_SQL", "scorer_revision": SCORER_REVISION,
               "sqlite_version": sqlite3.sqlite_version, "total": len(scores),
               "correct": sum(s["res"] for s in scores), "scores": scores,
@@ -119,7 +124,7 @@ def score_run(run_dir: Path, assets: Path, root: Path, timeout: float):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
-    parser.add_argument("--assets", type=Path, default=Path("data/bird-mini-dev"))
+    parser.add_argument("--assets", type=Path, default=Path(__file__).resolve().parent / "data" / "bird-mini-dev")
     parser.add_argument("--databases", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()

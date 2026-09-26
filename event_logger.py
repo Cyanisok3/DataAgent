@@ -27,14 +27,14 @@ def start_call(phase, view, config):
         ).lastrowid
 
 
-def finish_call(call_id, response, usage, status, elapsed_ms, error=None):
+def finish_call(call_id, response, usage, status, elapsed_ms, error=None, finish_reason=None):
     if call_id is None:
         return
     with connection() as conn:
         conn.execute(
-            """UPDATE model_calls SET response=?,usage=?,status=?,elapsed_ms=?,error=?
+            """UPDATE model_calls SET response=?,usage=?,status=?,elapsed_ms=?,error=?,finish_reason=?
             WHERE id=? AND status='running'""",
-            (response, serialize(usage), status, elapsed_ms, error, call_id),
+            (response, serialize(usage), status, elapsed_ms, error, finish_reason, call_id),
         )
 
 
@@ -72,6 +72,7 @@ def usage_stats(sid):
             "phase": latest["phase"],
             "model": json.loads(latest["config"])["model"],
             "status": latest["status"],
+            "finish_reason": latest["finish_reason"],
             "usage": usage,
         },
         "round_usage": {

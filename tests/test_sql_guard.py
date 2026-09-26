@@ -69,6 +69,15 @@ def test_union_and_dates(business):
     assert execute_query(query.execution_sql, path=business)["rows"] == [["2020-01-02"]]
 
 
+def test_logical_operators_allow_predicates_but_still_check_nested_functions(business):
+    query = prepare_query(
+        "SELECT id FROM orders WHERE (id=1 OR id=2) AND NOT amount=1", SCHEMA
+    )
+    assert execute_query(query.execution_sql, path=business)["rows"] == [[1]]
+    with pytest.raises(SqlSecurityError, match="readfile"):
+        prepare_query("SELECT id FROM orders WHERE id=1 AND (id=2 OR readfile('/tmp/x')=1)", SCHEMA)
+
+
 def test_timeout_and_readonly(business):
     with pytest.raises(TimeoutError):
         execute_query(

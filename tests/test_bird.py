@@ -11,11 +11,11 @@ import pytest
 
 import llm
 import session_store
+from benchmark.bird_data import load_source
+from benchmark.bird_eval import run_question, validate_frozen_run
+from benchmark.bird_score import score_one
+from benchmark.eval_budget import EvaluationBudget, EvaluationBudgetExceeded
 from datasource import CURRENT_SOURCE, DataSource
-from scripts.bird_data import load_source
-from scripts.bird_eval import run_question
-from scripts.bird_score import score_one
-from scripts.eval_budget import EvaluationBudget, EvaluationBudgetExceeded
 from sql_guard import SqlSecurityError, prepare_query
 from tools import execute_sql, get_metric_caliber, get_table_schema
 
@@ -70,6 +70,57 @@ def test_budget_reserves_before_call_and_does_not_overspend():
     assert budget.tokens_reserved == 90 and budget.calls_reserved == 1
 
 
+def test_unlimited_cost_records_usage_without_invented_price():
+    budget = EvaluationBudget(None, None, None, None)
+    budget.reserve(10_000, 1024)
+    assert budget.report()["cost_reserved"] is None
+    assert budget.report()["max_cost"] is None
+    assert budget.calls_reserved == 1 and budget.tokens_reserved == 11024
+    with pytest.raises(ValueError):
+        EvaluationBudget(None, Decimal(10), None, None)
+
+
+def test_full_run_requires_unchanged_scored_debug(tmp_path):
+    manifest = {"scope": "full", "question_ids": list(range(500)), "model": "fixed"}
+    with pytest.raises(ValueError, match="requires_frozen"):
+        validate_frozen_run(manifest, None)
+    previous = dict(manifest, scope="debug", question_ids=list(range(20)))
+    (tmp_path / "manifest.json").write_text(json.dumps(previous))
+    (tmp_path / "score.json").write_text(json.dumps({
+        "scope": "debug", "metric": "official_EX_full_SQL",
+        "scorer_revision": "abd11b6db92a1c9f809b32f7564c7c71b34d67f0",
+        "total": 20, "correct": 1,
+        "scores": [{"question_id": qid} for qid in previous["question_ids"]],
+    }))
+    validate_frozen_run(manifest, tmp_path)
+    score_path = tmp_path / "score.json"
+    score = json.loads(score_path.read_text())
+    score["correct"] = 0
+    score_path.write_text(json.dumps(score))
+    with pytest.raises(ValueError, match="exact_match_required"):
+        validate_frozen_run(manifest, tmp_path)
+    score["correct"] = 1
+    score_path.write_text(json.dumps(score))
+    with pytest.raises(ValueError, match="configuration_changed"):
+        validate_frozen_run(dict(manifest, model="changed"), tmp_path)
+
+
+def test_business_regression_uses_snapshot_and_restores_globals(tmp_path, monkeypatch, source):
+    from benchmark import regression_9q
+    previous = session_store.DB_PATH, llm.WATERMARK_TOKENS
+    monkeypatch.setattr(regression_9q, "DEFAULT_SOURCE", source)
+    seen = []
+    def fake_question(q, injected, budget, timeout, max_calls, **kwargs):
+        seen.append(injected)
+        assert kwargs["require_sql"] is False and injected.clock.year == 2026
+        return {"status": "completed"}
+    monkeypatch.setattr(regression_9q, "run_question", fake_question)
+    report = regression_9q.run_regression(tmp_path / "run", execute=True, input_budget=6000)
+    assert len(seen) == 9 and seen[0].path != source.path
+    assert report["database_unchanged"]
+    assert (session_store.DB_PATH, llm.WATERMARK_TOKENS) == previous
+
+
 def test_full_agent_selects_final_query_not_last_probe(source, monkeypatch):
     requests, selected = [], []
     steps = iter([
@@ -107,15 +158,15 @@ def test_full_agent_selects_final_query_not_last_probe(source, monkeypatch):
                                          ('SELECT amount+1 FROM "Values Table"', 0),
                                          ('DELETE FROM "Values Table"', 0)])
 def test_official_ex_correct_wrong_readonly(source, sql, expected):
-    assets = Path(__file__).parents[1] / "data" / "bird-mini-dev"
+    assets = Path(__file__).parents[1] / "benchmark" / "data" / "bird-mini-dev"
     if not (assets / "evaluation_ex.py").exists():
-        pytest.skip("先运行 python -m scripts.bird_data 下载固定官方评分源码")
+        pytest.skip("先运行 python -m benchmark.bird_data 下载固定官方评分源码")
     score = score_one(sql, 'SELECT amount FROM "Values Table"', source.path, assets)
     assert score["res"] == expected
 
 
 def test_official_ex_hard_timeout(source):
-    assets = Path(__file__).parents[1] / "data" / "bird-mini-dev"
+    assets = Path(__file__).parents[1] / "benchmark" / "data" / "bird-mini-dev"
     if not (assets / "evaluation_ex.py").exists():
         pytest.skip("固定官方评分源码未准备")
     sql = 'SELECT SUM(a.amount*b.amount*c.amount*d.amount) FROM "Values Table" a, "Values Table" b, "Values Table" c, "Values Table" d'

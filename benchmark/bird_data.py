@@ -132,6 +132,6 @@ def load_source(root: Path, db_id: str) -> DataSource:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("data/bird-mini-dev"))
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "data" / "bird-mini-dev")
     args = parser.parse_args()
     print(json.dumps(prepare(args.output), ensure_ascii=False, indent=2))

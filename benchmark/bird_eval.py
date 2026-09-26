@@ -1,19 +1,20 @@
 """复用生产会话执行器跑 Mini-Dev；默认仅预检，--execute 才请求真实模型。"""
 import argparse
 import json
+import math
+import os
+import platform
 import sqlite3
 import threading
 import time
 from dataclasses import asdict
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
 
 import llm
 import session_store
-from context import serialize
-from event_logger import usage_stats
-from run_context import RunContext
-from scripts.bird_data import (
+from benchmark.bird_data import (
     DATA_REVISION,
     SCORER_REVISION,
     file_hash,
@@ -21,8 +22,34 @@ from scripts.bird_data import (
     prepare,
     write_json,
 )
-from scripts.eval_budget import EvaluationBudget
+from benchmark.eval_budget import EvaluationBudget
+from context import serialize
+from event_logger import usage_stats
+from run_context import RunContext
 from session_runner import run_session
+
+
+def code_snapshot():
+    root = Path(__file__).resolve().parents[1]
+    paths = sorted(root.glob("*.py")) + sorted((root / "benchmark").glob("*.py"))
+    return {str(p.relative_to(root)): file_hash(p) for p in paths}
+
+
+def validate_frozen_run(manifest, debug_run):
+    if debug_run is None:
+        raise ValueError("full_run_requires_frozen_debug_run")
+    previous = json.loads((debug_run / "manifest.json").read_text())
+    score = json.loads((debug_run / "score.json").read_text())
+    if (previous["scope"] != "debug" or score["scope"] != "debug"
+            or score["metric"] != "official_EX_full_SQL"
+            or score["scorer_revision"] != SCORER_REVISION
+            or score["total"] != 20
+            or score["correct"] < 1
+            or [row["question_id"] for row in score["scores"]] != previous["question_ids"]):
+        raise ValueError("scored_20_question_debug_with_exact_match_required")
+    for key in manifest.keys() - {"scope", "question_ids", "tuning"}:
+        if manifest[key] != previous.get(key):
+            raise ValueError(f"frozen_configuration_changed:{key}")
 
 
 def select_questions(assets, scope):
@@ -79,15 +106,34 @@ def run_evaluation(args):
                 "model": args.model, "context_window": llm.CONTEXT_WINDOW,
                 "output_tokens": llm.OUTPUT_TOKENS, "max_calls_per_question": args.max_calls,
                 "timeout_per_question": args.timeout, "input": "question+evidence",
+                "api_timeout": float(os.getenv("DATAAGENT_API_TIMEOUT", "10")),
+                "python": platform.python_version(),
+                "dependencies": {name: version(name) for name in
+                                 ("openai", "pydantic", "SQLAlchemy", "sqlglot")},
+                "input_watermark": llm.WATERMARK_TOKENS,
+                "code_sha256": code_snapshot(),
+                "budget_config": {
+                    "max_tokens": args.max_tokens,
+                    "max_cost": args.max_cost,
+                    "unlimited_cost": args.unlimited_cost,
+                    "input_price": args.input_price,
+                    "output_price": args.output_price,
+                    "currency": args.currency,
+                },
                 "tuning": "fixed first 20 stratified by database; no automatic tuning"}
     # 包含 CSV 描述在内的目录快照，以便发现说明文件变化。
     manifest["catalogs"] = {id_: [asdict(t) for t in source.tables] for id_, source in sources.items()}
     if not args.execute:
         return dict(manifest, status="preflight_only_no_model_calls")
-    if not args.model or args.timeout <= 0 or args.max_calls <= 0:
+    if not args.model or not math.isfinite(args.timeout) or args.timeout <= 0 or args.max_calls <= 0:
         raise ValueError("model_and_positive_limits_required")
-    budget = EvaluationBudget(args.max_tokens, Decimal(args.max_cost),
-                              Decimal(args.input_price), Decimal(args.output_price))
+    if not args.unlimited_cost and args.max_cost is None:
+        raise ValueError("explicit_cost_limit_or_unlimited_cost_required")
+    budget = EvaluationBudget(args.max_tokens, Decimal(args.max_cost) if args.max_cost else None,
+                              Decimal(args.input_price) if args.input_price else None,
+                              Decimal(args.output_price) if args.output_price else None)
+    if args.scope == "full":
+        validate_frozen_run(manifest, args.frozen_debug_run)
     manifest["budget"] = budget.report()
     manifest["pricing"] = {"currency": args.currency, "input_per_million": args.input_price,
                            "output_per_million": args.output_price}
@@ -108,8 +154,30 @@ def run_evaluation(args):
             records.append(record)
             stream.write(serialize(record) + "\n")
             stream.flush()
-    report = {"total": len(records), "completed": sum(r["status"] == "completed" for r in records),
-              "not_run": sum(r["status"] == "not_run" for r in records), "budget": budget.report()}
+            print(serialize({"progress": len(records), "total": len(questions),
+                             "question_id": q["question_id"], "status": record["status"],
+                             "error": record["error"]}), flush=True)
+    provider_usage = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        values = [r.get("usage", {}).get("round_usage", {}).get(key) for r in records]
+        values = [value for value in values if value is not None]
+        provider_usage[key] = sum(values) if values else None
+    report = {
+        "total": len(records),
+        "completed": sum(r["status"] == "completed" for r in records),
+        "failed": sum(r["status"] == "failed" for r in records),
+        "not_run": sum(r["status"] == "not_run" for r in records),
+        "model_calls": sum(r.get("model_calls", 0) for r in records),
+        "tool_calls": sum(r.get("tool_calls", 0) for r in records),
+        "executed_queries": sum(r.get("executed_queries", 0) for r in records),
+        "cached_calls": sum(r.get("cached_calls", 0) for r in records),
+        "provider_usage": provider_usage,
+        "sessions_with_missing_usage": sum(
+            bool(r.get("usage", {}).get("missing_usage_phases")) for r in records),
+        "elapsed_seconds": round(sum(r.get("elapsed_seconds", 0) for r in records), 3),
+        "compressed_sessions": sum(bool(r.get("usage", {}).get("compressed")) for r in records),
+        "budget": budget.report(),
+    }
     write_json(args.output / "summary.json", report)
     # 官方文件格式，缺失预测保留空 SQL，绝不缩小评分分母。
     write_json(args.output / "predict_mini_dev.json", {
@@ -119,17 +187,20 @@ def run_evaluation(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--assets", type=Path, default=Path("data/bird-mini-dev"))
+    parser.add_argument("--assets", type=Path, default=Path(__file__).resolve().parent / "data" / "bird-mini-dev")
     parser.add_argument("--databases", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scope", choices=["debug", "full"], default="debug")
-    parser.add_argument("--model")
+    parser.add_argument("--model", default=llm.MODEL)
     parser.add_argument("--max-calls", type=int, default=14)
     parser.add_argument("--timeout", type=float, default=120)
-    parser.add_argument("--max-tokens", type=int, default=0)
-    parser.add_argument("--max-cost", default="0")
-    parser.add_argument("--input-price", default="0")
-    parser.add_argument("--output-price", default="0")
+    parser.add_argument("--max-tokens", type=int)
+    cost = parser.add_mutually_exclusive_group()
+    cost.add_argument("--max-cost")
+    cost.add_argument("--unlimited-cost", action="store_true")
+    parser.add_argument("--input-price")
+    parser.add_argument("--output-price")
+    parser.add_argument("--frozen-debug-run", type=Path)
     parser.add_argument("--currency", choices=["CNY", "USD"], default="CNY")
     parser.add_argument("--execute", action="store_true")
     print(json.dumps(run_evaluation(parser.parse_args()), ensure_ascii=False, indent=2))
