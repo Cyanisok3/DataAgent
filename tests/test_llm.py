@@ -27,7 +27,9 @@ def test_parse_action_rejects_output_without_a_valid_contract():
         parse_action('<｜｜DSML｜｜ invoke name="get_tables">')
 
 
-def test_completion_reserves_context_token_estimate(monkeypatch):
+@pytest.mark.parametrize("phase,thinking", [("decision", "enabled"), ("final", "disabled"),
+                                           ("summary", "disabled")])
+def test_completion_reserves_context_token_estimate(monkeypatch, phase, thinking):
     reservations = []
     fake_client = type("Client", (), {
         "chat": type("Chat", (), {
@@ -42,7 +44,12 @@ def test_completion_reserves_context_token_estimate(monkeypatch):
     token = CURRENT_RUN.set(run)
     messages = [{"role": "user", "content": "统计三家门店"}]
     try:
-        llm._completion(messages, "decision")
+        request = llm._completion(messages, phase)
     finally:
         CURRENT_RUN.reset(token)
-    assert reservations == [(estimate_tokens(serialize(messages)) + 2048, llm.OUTPUT_TOKENS)]
+    assert reservations == [(estimate_tokens(serialize(messages)) + 2048,
+                             llm.PHASE_OUTPUT_TOKENS[phase])]
+    assert request["extra_body"]["thinking"]["type"] == thinking
+    assert ("response_format" in request) == (phase != "final")
+    if phase == "decision":
+        assert request["reasoning_effort"] == "low" and "temperature" not in request

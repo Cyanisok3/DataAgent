@@ -10,7 +10,7 @@ from sqlglot.optimizer.scope import traverse_scope
 MAX_ROWS = 200
 SAFE_FUNCTIONS = frozenset(
     ["ABS", "AVG", "COUNT", "MAX", "MIN", "SUM", "ROUND", "COALESCE", "IFNULL", "NULLIF", "LOWER", "UPPER", "LENGTH", "SUBSTRING", "SUBSTR", "TRIM", "LTRIM", "RTRIM", "REPLACE", "DATE", "DATETIME", "TIME", "STRFTIME", "JULIANDAY", "CAST", "CASE", "IF", "IIF", "CURRENT_DATE", "CURRENT_TIMESTAMP", "CURRENT_TIME", "GROUP_CONCAT", "CONCAT", "CONCAT_WS", "INSTR", "UNICODE", "CHAR", "TOTAL"]
-).union({"TIME_TO_STR", "TS_OR_DS_TO_TIMESTAMP"})  # SQLGlot 的 SQLite strftime 内部节点
+).union({"TIME_TO_STR", "TS_OR_DS_TO_TIMESTAMP", "STR_POSITION"})  # SQLGlot 的 SQLite 函数内部节点
 
 
 class SqlSecurityError(ValueError):

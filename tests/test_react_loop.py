@@ -16,8 +16,13 @@ def action(tool, **args):
     return {"thought": "下一步", "tool": tool, "args": args}
 
 
-def answer(*ids):
-    return {"thought": "足够证据", "evidence_ids": list(ids), "mode": "answer"}
+def answer(*ids, final_query_id=None, answer_columns=None):
+    action = {
+        "thought": "足够证据", "evidence_ids": list(ids), "mode": "answer",
+        "answer_columns": answer_columns or []}
+    if final_query_id is not None:
+        action["final_query_id"] = final_query_id
+    return action
 
 
 def run_script(monkeypatch, actions, results=None):
@@ -128,6 +133,7 @@ def test_structured_errors(name, args, error):
 def test_unknown_answer_reference_fails(monkeypatch):
     events, requests = run_script(monkeypatch, [answer("another-session")])
     assert events[-1]["error"] == "invalid_evidence_ids" and requests == "[]"
+    assert not any(e["type"] == "answer_selected" for e in events)
 
 
 def test_repeated_sql_reuses_result(monkeypatch):

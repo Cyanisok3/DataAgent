@@ -33,6 +33,7 @@ def run_session(sid: str, message: str, publish, cancel: threading.Event,
     source_token = CURRENT_SOURCE.set(source or CURRENT_SOURCE.get())
     token = CURRENT_RUN.set(run)
     answer, terminal = "", None
+    selection = {}
     try:
         run.check()
         run.turn = begin_turn(sid, message)
@@ -48,6 +49,8 @@ def run_session(sid: str, message: str, publish, cancel: threading.Event,
                     terminal = event
                     break
                 save_event(sid, run.turn, event)
+                if event["type"] == "answer_selected":
+                    selection = {k: event[k] for k in ("mode", "evidence_ids", "final_query_id")}
                 publish(event)
         terminal = terminal or {
             "type": "done",
@@ -83,6 +86,7 @@ def run_session(sid: str, message: str, publish, cancel: threading.Event,
                         "status": "cancelled",
                         "error": "client_disconnected",
                     }
+                terminal = {**selection, **terminal}
                 finish_turn(
                     sid,
                     run.turn,

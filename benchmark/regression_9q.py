@@ -34,7 +34,8 @@ def run_regression(output: Path, *, execute=False, input_budget=None, timeout=12
         raise ValueError("positive_input_budget_required")
     manifest = {
         "questions": QUESTIONS, "clock": "2026-09-24T00:00:00+08:00",
-        "model": llm.MODEL, "output_tokens": llm.OUTPUT_TOKENS,
+        "model": llm.MODEL,
+        "phase_options": {phase: llm.phase_options(phase) for phase in llm.PHASE_OUTPUT_TOKENS},
         "input_budget": input_budget or llm.WATERMARK_TOKENS,
         "max_calls": 14, "timeout": timeout, "code_sha256": code_snapshot(),
         "status": "execution_requested" if execute else "preflight_only_no_model_calls",

@@ -21,6 +21,7 @@ class AnswerAction(BaseModel):
     thought: str
     evidence_ids: list[str]
     final_query_id: str | None = None
+    answer_columns: list[str]
     mode: Literal["answer", "clarify"] = "answer"
 
 

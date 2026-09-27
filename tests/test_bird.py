@@ -121,11 +121,12 @@ def test_business_regression_uses_snapshot_and_restores_globals(tmp_path, monkey
     assert (session_store.DB_PATH, llm.WATERMARK_TOKENS) == previous
 
 
-def test_full_agent_selects_final_query_not_last_probe(source, monkeypatch):
+@pytest.mark.parametrize("final_reason", ["stop", "length"])
+def test_full_agent_selects_final_query_not_last_probe(source, monkeypatch, final_reason):
     requests, selected = [], []
     steps = iter([
         {"tool": "get_table_schema", "args": {"table_name": "Values Table"}},
-        {"tool": "execute_sql", "args": {"sql": 'SELECT SUM(amount) FROM "Values Table"'}},
+        {"tool": "execute_sql", "args": {"sql": 'SELECT SUM(amount) AS total FROM "Values Table"'}},
         {"tool": "execute_sql", "args": {"sql": 'SELECT MAX(amount) FROM "Values Table"'}},
     ])
     def complete(messages, phase, stream=False):
@@ -137,16 +138,23 @@ def test_full_agent_selects_final_query_not_last_probe(source, monkeypatch):
             selected[:] = [e["result"]["result_id"] for e in chain if e.get("result")]
             next_step = next(steps, None)
             action = dict(thought="行动说明", **next_step) if next_step else {
-                "thought": "完成", "evidence_ids": [selected[0]], "final_query_id": selected[0]}
+                "thought": "完成", "evidence_ids": [selected[0]], "final_query_id": selected[0],
+                "answer_columns": ["total"]}
             text = json.dumps(action)
         return iter([SimpleNamespace(choices=[
-            SimpleNamespace(delta=SimpleNamespace(content=text), finish_reason="stop")])])
+            SimpleNamespace(delta=SimpleNamespace(content=text),
+                            finish_reason=final_reason if phase == "final" else "stop")])])
     monkeypatch.setattr(llm, "_completion", complete)
     q = {"question_id": 5, "db_id": "sample", "question": "合计？",
          "evidence": "amount 是数量", "SQL": "FORBIDDEN_GOLD_MARKER"}
     budget = EvaluationBudget(100000, Decimal(10), Decimal(1), Decimal(1))
     record = run_question(q, source, budget, 30, 14)
-    assert record["status"] == "completed" and "SUM" in record["sql"] and "MAX" not in record["sql"]
+    assert record["query_selected"] and record["final_query_id"] == selected[0]
+    if final_reason == "stop":
+        assert record["status"] == "completed" and "SUM" in record["sql"] and "MAX" not in record["sql"]
+    else:
+        assert record["status"] == "failed" and record["error"] == "OutputTruncated"
+        assert record["sql"] is None and record["answer"] == "已经查询。"
     assert record["executed_queries"] == 2
     assert "FORBIDDEN_GOLD_MARKER" not in str(requests)
     with session_store.connection() as conn:

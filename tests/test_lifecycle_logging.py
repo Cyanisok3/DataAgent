@@ -186,3 +186,27 @@ def test_deadline_and_model_budget_are_bounded():
     run.cancel.set()
     with pytest.raises(RunCancelled):
         run.check()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_selected_query_survives_final_failure_or_cancellation(monkeypatch, cancelled):
+    cancel = threading.Event()
+
+    def stream(*args):
+        yield {"type": "answer_selected", "mode": "answer",
+               "evidence_ids": ["r"], "final_query_id": "r"}
+        yield {"type": "text_chunk", "content": "部分"}
+        if cancelled:
+            cancel.set()
+            raise RunCancelled()
+        raise RuntimeError("stream_error")
+
+    monkeypatch.setattr(runner, "run_react_stream", stream)
+    runner.run_session("a", "q", lambda e: None, cancel)
+    with store.connection() as conn:
+        events = conn.execute("SELECT payload FROM events WHERE type='done'").fetchall()
+    assert len(events) == 1
+    event = json.loads(events[0][0])
+    assert event["final_query_id"] == "r" and event["evidence_ids"] == ["r"]
+    assert event["status"] == ("cancelled" if cancelled else "failed")
+    assert terminal("a")["answer"] == "部分"

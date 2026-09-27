@@ -122,3 +122,28 @@ def test_execute_tool_failure_keeps_attempted_sql(monkeypatch):
     assert result.is_error and result.error_type == "timeout"
     assert result.query["model_sql"] == "SELECT 1"
     assert result.sql.endswith("LIMIT 201") and result.query["status"] == "failed"
+
+
+def test_instr_alias_round_trips_to_sqlite(business):
+    query = prepare_query("SELECT INSTR('abc', 'b'), INSTR('abc', 'z')", {})
+    assert execute_query(query.execution_sql, path=business)["rows"] == [[2, 0]]
+    with pytest.raises(SqlSecurityError, match="readfile"):
+        prepare_query("SELECT INSTR(readfile('/tmp/x'), 'b')", {})
+
+
+@pytest.mark.parametrize("message,error_type", [("resource_limit: 单元格过大", "resource_limit"),
+                                               ("other error", "execution")])
+def test_resource_limit_hint_is_not_a_schema_error(monkeypatch, message, error_type):
+    import tools
+
+    def fail(sql):
+        raise ValueError(message)
+
+    monkeypatch.setattr(tools, "execute_query", fail)
+    result = tools.execute_sql("SELECT 1")
+    assert result.error_type == error_type and result.query["status"] == "failed"
+    assert result.query["model_sql"] == "SELECT 1"
+    if error_type == "resource_limit":
+        assert "COUNT/GROUP BY" in result.content and "get_table_schema" not in result.content
+    else:
+        assert "get_table_schema" in result.content

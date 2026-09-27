@@ -62,7 +62,7 @@ def test_dsml_uses_first_call_and_does_not_skip_invalid_first():
     assert parse_action(dsml("get_domains") + dsml())["tool"] == "get_domains"
     with pytest.raises(json.JSONDecodeError):
         parse_action(dsml("unknown") + dsml("get_domains"))
-    action = '{"thought":"回答","evidence_ids":[]}'
+    action = '{"thought":"回答","evidence_ids":[],"answer_columns":[]}'
     assert parse_action(action + dsml("get_domains"))["evidence_ids"] == []
     assert parse_action(dsml(params=[("question", "true", action)]))["tool"] == "get_tables"
 
@@ -114,22 +114,41 @@ def test_length_decision_recovers_complete_action_and_logs_truncation(monkeypatc
     assert json.loads(row["usage"])["completion_tokens"] == 1024
 
 
-def test_length_incomplete_action_gets_only_one_repair(monkeypatch):
+@pytest.mark.parametrize("content", ["", '{"thought":'])
+def test_length_incomplete_action_never_gets_format_repair(monkeypatch, content):
     calls = []
 
     def complete(*args, **kwargs):
         calls.append(args)
-        return chunks('{"thought":', "length")
+        return chunks(content, "length")
 
     monkeypatch.setattr(llm, "_completion", complete)
-    with pytest.raises(json.JSONDecodeError):
-        llm.chat([{"role": "user", "content": "q"}])
-    assert len(calls) == 2
+    run = RunContext()
+    token = CURRENT_RUN.set(run)
+    try:
+        with pytest.raises(llm.OutputBudgetExhausted):
+            llm.chat([{"role": "user", "content": "q"}])
+        assert run.repairs == 0
+    finally:
+        CURRENT_RUN.reset(token)
+    assert len(calls) == 1
+
+
+def test_output_budget_exhausted_is_logged_as_terminal_without_retry(monkeypatch):
+    monkeypatch.setattr(llm, "_completion", lambda *a, **k: chunks("", "length"))
+    events = []
+    session_runner.run_session("a", "q", events.append, threading.Event())
+    assert events[-1]["error"] == "OutputBudgetExhausted"
+    with store.connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM model_calls").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE type='done'").fetchone()[0] == 1
+        assert conn.execute("SELECT status,error FROM turns").fetchone()[:] == (
+            "failed", "OutputBudgetExhausted")
 
 
 def test_final_length_keeps_partial_text_but_never_completes(monkeypatch):
     monkeypatch.setattr(react_loop, "chat", lambda *a: {
-        "thought": "回答", "evidence_ids": [], "mode": "answer"})
+        "thought": "回答", "evidence_ids": [], "answer_columns": [], "mode": "answer"})
     monkeypatch.setattr(llm, "_completion", lambda *a, **k: chunks("部分回答", "length"))
     events = []
     session_runner.run_session("a", "q", events.append, threading.Event())
@@ -140,6 +159,9 @@ def test_final_length_keeps_partial_text_but_never_completes(monkeypatch):
     assert turn["answer"] == "部分回答" and turn["status"] == "failed"
     assert turn["error"] == "OutputTruncated"
     assert call["finish_reason"] == "length" and call["status"] == "truncated"
+    config = json.loads(call["config"])
+    for key, value in llm.phase_options("final").items():
+        assert config[key] == value
     assert events[-1]["status"] == "failed"
     assert visible_history(store.load_messages("a")) == []
 
@@ -147,7 +169,7 @@ def test_final_length_keeps_partial_text_but_never_completes(monkeypatch):
 @pytest.mark.parametrize("reason", [None, "content_filter", "tool_calls"])
 def test_other_finish_reasons_are_not_salvaged(monkeypatch, reason):
     monkeypatch.setattr(llm, "_completion", lambda *a, **k: chunks(
-        '{"thought":"回答","evidence_ids":[]}', reason))
+        '{"thought":"回答","evidence_ids":[],"answer_columns":[]}', reason))
     with pytest.raises(llm.ProviderResponseIncomplete):
         llm.chat([{"role": "user", "content": "q"}])
 

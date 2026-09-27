@@ -101,7 +101,7 @@ def get_metric_caliber(hint: str) -> ToolResult:
 @validate_call(config=ConfigDict(strict=True))
 def execute_sql(sql: str) -> ToolResult:
     """工具：先过安全护栏，再执行 SQL，返回 ToolResult（含结构化执行依据）。
-    错误文本保持简短（异常 + 引导语），模型据此调 get_table_schema 自我修正。"""
+    错误文本区分资源限制和执行错误，模型据此调整查询。"""
     try:
         prepared = prepare_query(
             sql, {t.name.lower(): t.columns for t in CURRENT_SOURCE.get().tables if t.is_visible},
@@ -124,12 +124,15 @@ def execute_sql(sql: str) -> ToolResult:
     except RunCancelled:
         raise
     except Exception as e:  # noqa: BLE001 — 工具边界，取消单独传播
+        resource_limit = isinstance(e, ValueError) and "resource_limit" in str(e)
+        error_type = "timeout" if isinstance(e, TimeoutError) else "execution"
+        hint = "如需确认列名，请调用 get_table_schema 查看完整表结构。"
+        if resource_limit:
+            error_type = "resource_limit"
+            hint = "请用 COUNT/GROUP BY 缩小范围，或分页读取少量样例；不要拼接全部明细。"
         return ToolResult(
-            content=(
-                f"❌ SQL 执行失败：{type(e).__name__}: {e}\n"
-                "如需确认列名，请调用 get_table_schema 查看完整表结构。"
-            ),
-            error_type="timeout" if isinstance(e, TimeoutError) else "execution",
+            content=f"❌ SQL 执行失败：{type(e).__name__}: {e}\n{hint}",
+            error_type=error_type,
             query={"model_sql": sql, "sql": prepared.sql, "execution_sql": prepared.execution_sql,
                    "status": "failed"},
         )

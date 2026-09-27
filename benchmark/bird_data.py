@@ -105,6 +105,25 @@ def _descriptions(path: Path) -> dict[str, str]:
         for row in csv.DictReader(io.StringIO(text)) if row.get("original_column_name")}
 
 
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _column_profile(conn, table_quoted: str, column: str, type_: str) -> str:
+    """从数据库提取列的数值范围或少量示例值；长文本与异常一律跳过。"""
+    col = _quote_ident(column)
+    if (type_ or "").upper() in ("INTEGER", "REAL", "NUMERIC", "FLOAT", "DOUBLE"):
+        mn, mx = conn.execute(
+            f"SELECT MIN({col}), MAX({col}) FROM {table_quoted}").fetchone()
+        return f"范围: {mn} ~ {mx}" if mn is not None else ""
+    samples = [r[0] for r in conn.execute(
+        f"SELECT DISTINCT {col} FROM {table_quoted} WHERE {col} IS NOT NULL LIMIT 3"
+    ).fetchall()]
+    if not samples or any(len(str(s)) > 40 for s in samples):
+        return ""
+    return "示例: " + ", ".join(repr(s) for s in samples)
+
+
 def load_source(root: Path, db_id: str) -> DataSource:
     path = database_path(root, db_id)
     tables = []
@@ -112,18 +131,28 @@ def load_source(root: Path, db_id: str) -> DataSource:
         names = [r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
         for name in names:
-            quoted = '"' + name.replace('"', '""') + '"'
+            quoted = _quote_ident(name)
             columns = conn.execute(f"PRAGMA table_info({quoted})").fetchall()
             foreign = conn.execute(f"PRAGMA foreign_key_list({quoted})").fetchall()
+            row_count = conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
             metadata = path.parent / "database_description" / f"{name}.csv"
             if not metadata.resolve().is_relative_to(path.parent.resolve()):
                 raise ValueError("external_schema_description")
             descriptions = _descriptions(metadata)
             for _, column, type_, _, _, pk in columns:
                 descriptions[column] = f"type={type_}; primary_key={bool(pk)}; " + descriptions.get(column, "")
+                profile = _column_profile(conn, quoted, column, type_)
+                if profile:
+                    descriptions[column] += f"; {profile}"
+            fk_notes: dict[str, list[str]] = {}
             for fk in foreign:
-                descriptions[fk[3]] += f"; references {fk[2]}.{fk[4]}"
-            tables.append(Table(name=name, description=name, domain_key=db_id,
+                note = f"references {fk[2]}.{fk[4]}" if fk[4] else f"references {fk[2]}（主键）"
+                notes = fk_notes.setdefault(fk[3], [])
+                if note not in notes:
+                    notes.append(note)
+            for col, notes in fk_notes.items():
+                descriptions[col] += "; " + "; ".join(notes)
+            tables.append(Table(name=name, description=f"{name}（{row_count} 行）", domain_key=db_id,
                                 columns=[c[1] for c in columns], is_visible=True,
                                 keywords=[], column_descriptions=descriptions))
     return DataSource(path=path, tables=tables,

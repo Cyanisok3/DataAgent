@@ -5,11 +5,11 @@ import time
 from pydantic import ValidationError
 
 from context import serialize
-from llm import ContextLengthExceeded, chat, chat_stream_final
+from llm import ContextLengthExceeded, OutputBudgetExhausted, chat, chat_stream_final
 from run_context import CURRENT_RUN, RunCancelled
 from tools import TOOLS, ToolResult
 
-MAX_ITERS = 10
+MAX_ITERS = 12
 
 
 def _invoke_tool(name: str, args: dict, results: dict) -> ToolResult:
@@ -37,6 +37,27 @@ def _invoke_tool(name: str, args: dict, results: dict) -> ToolResult:
         )
 
 
+def _answer_column_error(action, results) -> dict | None:
+    """最终查询返回列必须与模型声明的答案列一致；不通过返回反馈事件让其重写。"""
+    final_id = action.get("final_query_id")
+    declared = [str(c).lower() for c in action.get("answer_columns", [])]
+    if final_id is None or not declared:
+        return None
+    actual = [str(c).lower() for c in results[final_id].get("columns", [])]
+    if declared == actual:
+        return None
+    return {
+        "type": "tool_result", "name": "answer_guard",
+        "input": {}, "output": (
+            f"最终查询返回列 {actual} 与问题要求的答案列 {declared} 不符。"
+            "请重写最终 SQL：只 SELECT 问题直接要求的列，去掉计数、姓名、关联键等辅助列，"
+            "再用新的 final_query_id 与 answer_columns 重新作答。"),
+        "result": None, "is_error": True, "error_type": "answer_columns_mismatch",
+        "sql": None, "query": None, "cached": False,
+        "invocation": 0, "elapsed_ms": 0,
+    }
+
+
 def _answer(action, user_message, history, results, messages, invocations):
     ids = action["evidence_ids"]
     if len(ids) != len(set(ids)) or any(id_ not in results for id_ in ids):
@@ -47,6 +68,10 @@ def _answer(action, user_message, history, results, messages, invocations):
     if final_id is not None and (final_id not in ids or not results[final_id].get("sql")):
         yield {"type": "done", "status": "failed", "error": "invalid_final_query_id"}
         return
+    yield {
+        "type": "answer_selected", "mode": action["mode"],
+        "evidence_ids": ids, "final_query_id": final_id,
+    }
     for chunk in chat_stream_final(
         user_message, evidence, history, messages, action["mode"]
     ):
@@ -75,6 +100,12 @@ def run_react_stream(user_message: str, history=None, results=None, **_):
             yield {"type": "action", "action": action}
             yield {"type": "thinking", "content": action["thought"]}
             if "evidence_ids" in action:
+                column_error = _answer_column_error(action, results)
+                if column_error:
+                    yield column_error
+                    messages.append(
+                        dict(column_error, role="tool", content=column_error["output"]))
+                    continue
                 yield from _answer(
                     action, user_message, history, results, messages, invocations
                 )
@@ -135,6 +166,8 @@ def run_react_stream(user_message: str, history=None, results=None, **_):
         yield {
             "type": "error",
             "error": error,
-            "content": "本轮未完成，请检查错误类型或缩小问题范围。",
+            "content": "决策输出预算耗尽，未得到完整动作；本轮未执行格式修复。"
+            if isinstance(exc, OutputBudgetExhausted)
+            else "本轮未完成，请检查错误类型或缩小问题范围。",
         }
         yield {"type": "done", "status": "failed", "error": error}
